@@ -1,0 +1,14 @@
+import Foundation
+
+struct CompletionUndo: Identifiable {
+    let id: UUID
+    let itemID: UUID
+    let originalPosition: CGPoint
+    let startedAt: TimeInterval
+    static let duration: TimeInterval = 3
+
+    func remaining(at uptime: TimeInterval) -> TimeInterval {
+        max(0, Self.duration - (uptime - startedAt))
+    }
+}
+

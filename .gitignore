@@ -1,0 +1,33 @@
+# Rebuildable output and Xcode local state
+/build/
+/.build/
+/DerivedData/
+**/xcuserdata/
+*.xcuserstate
+*.xcresult/
+
+# Applications, installers, archives and debug symbols
+*.app/
+*.dmg
+*.pkg
+*.xcarchive/
+*.dSYM/
+
+# Logs
+*.log
+*.log.*
+logs/
+
+# Local databases and exported user backups
+*.store
+*.store-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.pindobackup
+
+# macOS metadata
+.DS_Store
+._*
+
