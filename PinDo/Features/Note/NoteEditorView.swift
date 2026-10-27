@@ -3,6 +3,8 @@ import SwiftUI
 struct NoteEditorView: View {
     @StateObject private var editor: NoteEditorModel
     let now: Date
+    let projects: [Project]
+    let projectLabel: (Project) -> String
     let submit: (NoteDraft) -> Void
     let cancel: () -> Void
     let abandon: (UUID) -> Void
@@ -13,12 +15,14 @@ struct NoteEditorView: View {
     private var draft: NoteDraft { editor.draft }
 
     init(
-        draft: NoteDraft, now: Date, submit: @escaping (NoteDraft) -> Void,
+        draft: NoteDraft, now: Date, projects: [Project], projectLabel: @escaping (Project) -> String, submit: @escaping (NoteDraft) -> Void,
         cancel: @escaping () -> Void, abandon: @escaping (UUID) -> Void,
         draftChanged: @escaping (NoteDraft) -> Void
     ) {
         _editor = StateObject(wrappedValue: NoteEditorModel(draft: draft))
         self.now = now
+        self.projects = projects
+        self.projectLabel = projectLabel
         self.submit = submit
         self.cancel = cancel
         self.abandon = abandon
@@ -78,13 +82,20 @@ struct NoteEditorView: View {
                         .datePickerStyle(.field)
                         .accessibilityLabel("截止时间")
                 }
-                Picker("类别", selection: $editor.draft.categoryID) {
-                    Text("无类别").tag("")
-                    ForEach(TodoCategory.examples) { category in
-                        Text(category.name).tag(category.id)
+                Menu {
+                    Button("未分配项目") { editor.draft.projectID = nil }
+                    ForEach(projects) { project in
+                        Button(projectLabel(project)) { editor.draft.projectID = project.id }
                     }
+                } label: {
+                    Label(projects.first(where: { $0.id == draft.projectID }).map(projectLabel) ?? "未分配项目", systemImage: "folder")
+                        .lineLimit(1)
                 }
-                .frame(maxWidth: 260, alignment: .leading)
+                .menuStyle(.borderlessButton)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 360, alignment: .leading)
+                .help("按需更改项目，直接填写标题即可保存")
+                .accessibilityLabel("所属项目")
             }
             .font(.system(size: 13))
 
@@ -117,7 +128,7 @@ struct NoteEditorView: View {
         .background(appearance.fill, in: RoundedRectangle(cornerRadius: 10))
         .overlay {
             RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(appearance.border(category: draft.category), lineWidth: 2)
+                .strokeBorder(appearance.border(project: projects.first { $0.id == draft.projectID }), lineWidth: 2)
                 .allowsHitTesting(false)
         }
         .shadow(color: .black.opacity(0.22), radius: 35, y: 12)

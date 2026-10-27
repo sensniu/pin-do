@@ -3,6 +3,7 @@ import SwiftUI
 struct StickyNoteView: View {
     let item: TodoItem
     let now: Date
+    let project: Project?
     let edit: () -> Void
     let complete: () -> Void
     @Environment(\.colorScheme) private var scheme
@@ -15,10 +16,13 @@ struct StickyNoteView: View {
             HStack {
                 StarsView(count: item.stars)
                 Spacer()
-                if let category = item.category {
-                    Text(category.name)
+                if let project {
+                    Text(project.name)
                         .font(.system(size: 10))
                         .opacity(0.68)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .help(project.name)
                         .padding(.trailing, 2)
                 }
                 Button(action: complete) {
@@ -80,7 +84,7 @@ struct StickyNoteView: View {
         .background(appearance.fill, in: RoundedRectangle(cornerRadius: 5))
         .overlay {
             RoundedRectangle(cornerRadius: 5)
-                .strokeBorder(appearance.border(category: item.category), lineWidth: item.category == nil ? 1 : 2)
+                .strokeBorder(appearance.border(project: project), lineWidth: project == nil ? 1 : 2)
                 .allowsHitTesting(false)
         }
         .shadow(color: .black.opacity(scheme == .dark ? 0.18 : 0.07), radius: 6, x: 0, y: 3)

@@ -23,13 +23,13 @@ struct NoteAppearance {
         return .black
     }
 
-    func border(category: TodoCategory?) -> Color {
-        guard let category else { return ink.opacity(0.12) }
+    func border(project: Project?) -> Color {
+        guard let project else { return ink.opacity(0.12) }
         let boost = scheme == .dark ? 0.18 : 0.0
         return Color(
-            red: min(1, category.red + boost),
-            green: min(1, category.green + boost),
-            blue: min(1, category.blue + boost)
+            red: min(1, project.red + boost),
+            green: min(1, project.green + boost),
+            blue: min(1, project.blue + boost)
         )
     }
 }

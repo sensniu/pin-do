@@ -10,6 +10,9 @@ final class BoardModel: ObservableObject {
     @Published private(set) var undo: CompletionUndo?
     @Published var draft: NoteDraft?
     @Published var errorMessage: String?
+    @Published var notice: String?
+    @Published private(set) var projects: [Project]
+    @Published private(set) var selectedScope: BoardScope = .all
 
     private let date: () -> Date
     private let uptime: () -> TimeInterval
@@ -19,11 +22,12 @@ final class BoardModel: ObservableObject {
     private var draftSave: Task<Void, Never>?
 
     init(
-        items: [TodoItem], date: @escaping () -> Date = Date.init,
+        items: [TodoItem], projects: [Project] = [], date: @escaping () -> Date = Date.init,
         uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         persistence: (any TodoPersisting)? = nil
     ) {
         self.items = items
+        self.projects = projects
         self.date = date
         self.uptime = uptime
         self.persistence = persistence
@@ -31,6 +35,101 @@ final class BoardModel: ObservableObject {
     }
 
     var activeItems: [TodoItem] { items.filter { $0.status == .active } }
+    var visibleItems: [TodoItem] { activeItems.filter { selectedScope.includes($0) } }
+    var activeProjects: [Project] { projects.filter { $0.status == .active }.sorted { $0.createdAt < $1.createdAt } }
+    var boardTitle: String {
+        switch selectedScope {
+        case .all: "全部待办"
+        case .unassigned: "未分配项目"
+        case .project(let id): project(id)?.name ?? "未分配项目"
+        }
+    }
+    func project(_ id: UUID?) -> Project? { projects.first { $0.id == id } }
+    func projectLabel(_ project: Project) -> String {
+        let matches = projects.filter { $0.status != .deleted && $0.name == project.name }.sorted {
+            if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+        guard matches.count > 1 else { return project.name }
+        let number = (matches.firstIndex { $0.id == project.id } ?? 0) + 1
+        return "\(project.name) · \(project.createdAt.formatted(.dateTime.month().day())) · \(number)"
+    }
+
+    func selectScope(_ scope: BoardScope) {
+        guard draft == nil else { return }
+        do {
+            if let store = persistence as? any ProjectPersisting { apply(try store.loadBoardData()) }
+            if let id = scope.projectID, project(id)?.status != .active { throw StoreFailure.invalidProject }
+            selectedScope = scope
+            relayout()
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    private func apply(_ data: BoardData) {
+        projects = data.projects
+        items = data.items
+        if let receipt = undo, !items.contains(where: { $0.id == receipt.itemID }) { items.append(receipt.item) }
+    }
+
+    func createProject(name: String) -> Bool {
+        do {
+            let value: Project
+            if let store = persistence as? any ProjectPersisting { value = try store.createProject(name: name) }
+            else { value = Project(name: name.trimmingCharacters(in: .whitespacesAndNewlines), color: projects.count); try StoreArchive.validate(value) }
+            projects.append(value)
+            return true
+        } catch { errorMessage = error.localizedDescription; return false }
+    }
+
+    func renameProject(_ id: UUID, name: String) -> Bool {
+        mutateProject {
+            if let store = persistence as? any ProjectPersisting { return try store.renameProject(id: id, name: name) }
+            guard var value = project(id), value.status != .deleted else { throw StoreFailure.invalidProject }
+            value.name = name.trimmingCharacters(in: .whitespacesAndNewlines); value.updatedAt = date()
+            try StoreArchive.validate(value); return value
+        }
+    }
+
+    func restoreProject(_ id: UUID) {
+        _ = mutateProject {
+            if let store = persistence as? any ProjectPersisting { return try store.restoreProject(id: id) }
+            guard var value = project(id), value.status == .archived else { throw StoreFailure.invalidProject }
+            value.status = .active; value.archivedAt = nil; value.updatedAt = date(); return value
+        }
+    }
+
+    private func mutateProject(_ action: () throws -> Project) -> Bool {
+        do {
+            let value = try action()
+            if let index = projects.firstIndex(where: { $0.id == value.id }) { projects[index] = value }
+            return true
+        } catch { errorMessage = error.localizedDescription; return false }
+    }
+
+    func archiveProject(_ id: UUID) { changeProject(id, deleting: false, action: .transferToUnassigned) }
+    func deleteProject(_ id: UUID, action: UnfinishedProjectAction) { changeProject(id, deleting: true, action: action) }
+    private func changeProject(_ id: UUID, deleting: Bool, action: UnfinishedProjectAction) {
+        guard draft == nil else { return }
+        do {
+            if let store = persistence as? any ProjectPersisting {
+                let data = try deleting ? store.deleteProject(id: id, action: action) : store.archiveProject(id: id)
+                apply(data)
+            } else {
+                guard let index = projects.firstIndex(where: { $0.id == id && $0.status != .deleted }) else { throw StoreFailure.invalidProject }
+                for index in items.indices where items[index].status == .active && items[index].projectID == id {
+                    items[index].updatedAt = date()
+                    if deleting && action == .abandon { items[index].status = .abandoned; items[index].abandonedAt = date() }
+                    else {
+                        items[index].projectID = nil
+                        items[index].projectAssignments.append(ProjectAssignment(previousProjectID: id, projectID: nil, changedAt: date(), reason: deleting ? .deleted : .archived))
+                    }
+                }
+                projects[index].status = deleting ? .deleted : .archived
+                if deleting { projects[index].deletedAt = date() } else { projects[index].archivedAt = date() }
+            }
+            if selectedScope == .project(id) { selectedScope = .unassigned; relayout() }
+        } catch { errorMessage = error.localizedDescription }
+    }
 
     // A restored board replaces this session; its disappearing view must not save stale drafts.
     func retireAfterRestore() {
@@ -41,7 +140,9 @@ final class BoardModel: ObservableObject {
 
     func beginNew() {
         guard draft == nil else { return }
-        draft = NoteDraft(now: date())
+        var value = NoteDraft(now: date())
+        value.projectID = selectedScope.projectID
+        draft = value
     }
 
     func edit(_ item: TodoItem) {
@@ -84,12 +185,15 @@ final class BoardModel: ObservableObject {
 
     func submit(_ value: NoteDraft) {
         guard value.canSubmit else { return }
+        if let id = value.projectID, project(id)?.status != .active {
+            errorMessage = StoreFailure.invalidProject.localizedDescription; return
+        }
         let now = date()
         if value.isNew {
             let item = TodoItem(
                 id: value.id, title: value.title.trimmingCharacters(in: .whitespacesAndNewlines),
                 notes: value.notes, dueAt: value.hasDeadline ? value.dueAt : nil,
-                stars: value.stars, category: value.category, createdAt: now
+                stars: value.stars, projectID: value.projectID, createdAt: now
             )
             guard save(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true) else { return }
             relayout()
@@ -100,7 +204,7 @@ final class BoardModel: ObservableObject {
             item.notes = value.notes
             item.dueAt = value.hasDeadline ? value.dueAt : nil
             item.stars = min(3, max(1, value.stars))
-            item.category = value.category
+            item.projectID = value.projectID
             if item == previous { cancelEditing(); return }
             item.updatedAt = now
             let event = TodoEvent(itemID: item.id, kind: .edited, occurredAt: now, previousDeadline: previous.dueAt, newDeadline: item.dueAt)
@@ -125,7 +229,7 @@ final class BoardModel: ObservableObject {
         let event = TodoEvent(itemID: id, kind: .completed, occurredAt: now)
         guard save(item, event: event, clearDraft: false) else { return }
         let receipt = CompletionUndo(
-            id: event.id, itemID: id, originalPosition: position, startedAt: uptime()
+            id: event.id, itemID: id, originalPosition: position, startedAt: uptime(), scope: selectedScope, item: items[index]
         )
         expiration?.cancel()
         undo = receipt
@@ -147,11 +251,17 @@ final class BoardModel: ObservableObject {
         item.status = .active
         item.completedAt = nil
         item.updatedAt = date()
+        if let id = item.projectID, project(id)?.status != .active {
+            item.projectID = nil
+        }
         let event = TodoEvent(itemID: item.id, kind: .completionUndone, occurredAt: item.updatedAt, relatedCompletionID: receipt.id)
         guard save(item, event: event, clearDraft: false) else { return }
         expiration?.cancel()
-        layout.positions[receipt.itemID] = receipt.originalPosition
-        layout.bounds = layout.bounds.union(BoardLayoutEngine.frame(at: receipt.originalPosition))
+        if selectedScope.includes(items[index]) {
+            let point = selectedScope == receipt.scope ? receipt.originalPosition : vacantPosition()
+            layout.positions[receipt.itemID] = point
+            layout.bounds = layout.bounds.union(BoardLayoutEngine.frame(at: point))
+        } else { notice = "已恢复到\(project(items[index].projectID)?.name ?? "未分配项目")。" }
         undo = nil
     }
 
@@ -171,9 +281,14 @@ final class BoardModel: ObservableObject {
 
     private func save(_ item: TodoItem, event: TodoEvent, clearDraft: Bool) -> Bool {
         do {
-            try persistence?.commit(item, event: event, clearDraft: clearDraft)
-            if let index = items.firstIndex(where: { $0.id == item.id }) { items[index] = item }
-            else { items.append(item) }
+            var stored = item
+            if let persistence { stored = try persistence.commit(item, event: event, clearDraft: clearDraft) }
+            else if let prior = items.first(where: { $0.id == item.id }), prior.projectID != item.projectID {
+                stored.projectAssignments = prior.projectAssignments + [ProjectAssignment(previousProjectID: prior.projectID,
+                    projectID: item.projectID, changedAt: item.updatedAt, reason: event.kind == .completionUndone ? .completionRestored : .manual)]
+            }
+            if let index = items.firstIndex(where: { $0.id == item.id }) { items[index] = stored }
+            else { items.append(stored) }
             return true
         } catch {
             errorMessage = error.localizedDescription
@@ -181,15 +296,21 @@ final class BoardModel: ObservableObject {
         }
     }
 
+    private func vacantPosition() -> CGPoint {
+        let occupied = visibleItems.compactMap { layout.positions[$0.id] }.map { BoardLayoutEngine.frame(at: $0) }
+        let placeholder = TodoItem(title: "")
+        return engine.layout(items: [placeholder], now: date(), reserved: occupied).positions[placeholder.id] ?? .zero
+    }
+
     private func relayout() {
         let reservation: [CGRect]
-        if let receipt = undo, receipt.remaining(at: uptime()) > 0 {
+        if let receipt = undo, receipt.remaining(at: uptime()) > 0, receipt.scope == selectedScope {
             reservation = [BoardLayoutEngine.frame(at: receipt.originalPosition)]
         } else {
-            undo = nil
+            if let receipt = undo, receipt.remaining(at: uptime()) <= 0 { undo = nil }
             reservation = []
         }
-        layout = engine.layout(items: activeItems, now: date(), reserved: reservation)
+        layout = engine.layout(items: visibleItems, now: date(), reserved: reservation)
         layoutRevision += 1
     }
 }

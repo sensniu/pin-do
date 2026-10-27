@@ -2,6 +2,7 @@ import SwiftUI
 
 struct BoardView: View {
     @ObservedObject var model: BoardModel
+    var toggleSidebar: () -> Void = {}
     @StateObject private var clock = BoardClock()
     @StateObject private var session = BoardSession()
     @Environment(\.colorScheme) private var scheme
@@ -18,17 +19,17 @@ struct BoardView: View {
                     let scale = currentScale(size: geometry.size)
                     ZStack {
                         boardColor
-                        if model.activeItems.isEmpty {
+                        if model.visibleItems.isEmpty {
                             emptyState
                         }
-                        ForEach(model.activeItems) { item in
+                        ForEach(model.visibleItems) { item in
                             if let world = model.layout.positions[item.id] {
                                 let point = ViewportCalculator.position(
                                     world: world, bounds: model.layout.bounds, viewport: geometry.size,
                                     scale: scale, pan: session.pan
                                 )
                                 StickyNoteView(
-                                    item: item, now: clock.now,
+                                    item: item, now: clock.now, project: model.project(item.projectID),
                                     edit: { model.edit(item) },
                                     complete: { withAnimation(animation) { model.complete(item.id) } }
                                 )
@@ -77,38 +78,14 @@ struct BoardView: View {
             }
             .background(boardColor)
             .allowsHitTesting(model.draft == nil)
-            .overlay {
-                if let draft = model.draft {
-                    ZStack {
-                        Color.black.opacity(scheme == .dark ? 0.5 : 0.12)
-                            .contentShape(Rectangle())
-                            .accessibilityLabel("编辑中的便利贴")
-                        ScrollView(.vertical) {
-                            NoteEditorView(
-                                draft: draft, now: clock.now,
-                                submit: { value in withAnimation(animation) { model.submit(value) } },
-                                cancel: { withAnimation(animation) { model.cancelEditing() } },
-                                abandon: { id in withAnimation(animation) { model.abandon(id) } },
-                                draftChanged: { model.updateDraft($0) }
-                            )
-                            .id(draft.id)
-                            .padding(.vertical, 24)
-                            .frame(maxWidth: .infinity)
-                            .frame(minHeight: window.size.height)
-                        }
-                        .scrollIndicators(.hidden)
-                    }
-                    .transition(.opacity)
-                    .zIndex(2)
-                }
-            }
+
         }
-        .frame(minWidth: 760, minHeight: 560)
-        .onAppear { clock.start(items: model.activeItems) }
+        .frame(minWidth: 480, minHeight: 560)
+        .onAppear { clock.start(items: model.visibleItems) }
         .onDisappear { clock.stop(); model.flushDraft() }
-        .onChange(of: clock.now) { _, _ in clock.update(items: model.activeItems) }
-        .onChange(of: model.items) { _, _ in clock.update(items: model.activeItems) }
-        .onChange(of: model.layoutRevision) { _, _ in resetViewport() }
+        .onChange(of: clock.now) { _, _ in clock.update(items: model.visibleItems) }
+        .onChange(of: model.items) { _, _ in clock.start(items: model.visibleItems) }
+        .onChange(of: model.layoutRevision) { _, _ in resetViewport(); clock.start(items: model.visibleItems) }
         .onChange(of: model.fitRevision) { _, _ in withAnimation(animation) { resetViewport() } }
         .alert("操作未保存", isPresented: Binding(
             get: { model.errorMessage != nil },
@@ -121,12 +98,18 @@ struct BoardView: View {
     private var header: some View {
         HStack(alignment: .center) {
             VStack(alignment: .leading, spacing: 5) {
-                Text("白板").font(.system(size: 23, weight: .semibold))
-                let overdue = model.activeItems.filter { UrgencyPolicy().evaluate(dueAt: $0.dueAt, now: clock.now).isOverdue }.count
-                Text("\(model.activeItems.count) 项待办" + (overdue > 0 ? " · \(overdue) 项已逾期" : ""))
+                Text(model.boardTitle).font(.system(size: 23, weight: .semibold)).lineLimit(1).help(model.boardTitle)
+                let overdue = model.visibleItems.filter { UrgencyPolicy().evaluate(dueAt: $0.dueAt, now: clock.now).isOverdue }.count
+                Text("\(model.visibleItems.count) 项待办" + (overdue > 0 ? " · \(overdue) 项已逾期" : ""))
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
             Spacer()
+            Button(action: toggleSidebar) {
+                Image(systemName: "sidebar.right").font(.system(size: 18)).frame(width: 36, height: 40)
+            }
+            .buttonStyle(.plain)
+            .help("显示或隐藏项目栏")
+            .accessibilityLabel("项目侧栏")
             if let receipt = model.undo {
                 UndoCountdownView(receipt: receipt) {
                     withAnimation(animation) { model.undoCompletion() }

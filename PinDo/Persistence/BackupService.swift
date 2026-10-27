@@ -9,40 +9,82 @@ struct StoredValue: Codable, Sendable {
 }
 
 struct StoreArchive: Codable, Sendable {
-    var formatVersion: Int = 1
+    var formatVersion: Int = 2
     let appVersion: String
     let createdAt: Date
     let records: [StoredValue]
 
+    func upgraded() throws -> StoreArchive {
+        if formatVersion == 1 { return try LegacyDataMigration.convert(self) }
+        try validate()
+        return self
+    }
+
     func validate() throws {
-        guard formatVersion == 1 else { throw StoreFailure.unsupportedVersion }
+        if formatVersion == 1 { _ = try LegacyDataMigration.convert(self); return }
+        guard formatVersion == 2 else { throw StoreFailure.unsupportedVersion }
         guard Set(records.map(\.key)).count == records.count else { throw StoreFailure.invalidBackup }
         let decoder = JSONDecoder()
-        var itemIDs = Set<UUID>()
+        var items: [UUID: TodoItem] = [:], projects: [UUID: Project] = [:]
         var events: [TodoEvent] = []
-        var drafts = 0
+        var draft: NoteDraft?
+        var metadata = 0
         for record in records {
-            if record.bucket.hasPrefix("todo-") {
+            switch record.bucket {
+            case "todo-active", "todo-completed", "todo-abandoned":
                 let item = try decoder.decode(TodoItem.self, from: record.payload)
                 try Self.validate(item)
                 guard record.key == "todo:\(item.id.uuidString)", record.bucket == "todo-\(item.status.rawValue)" else { throw StoreFailure.invalidBackup }
-                itemIDs.insert(item.id)
-            } else if record.bucket == "event" {
+                items[item.id] = item
+            case "project":
+                let project = try decoder.decode(Project.self, from: record.payload)
+                try Self.validate(project)
+                guard record.key == "project:\(project.id.uuidString)" else { throw StoreFailure.invalidBackup }
+                projects[project.id] = project
+            case "event":
                 let event = try decoder.decode(TodoEvent.self, from: record.payload)
-                guard record.key == "event:\(event.id.uuidString)" else { throw StoreFailure.invalidBackup }
+                guard record.key == "event:\(event.id.uuidString)", event.occurredAt.timeIntervalSince1970.isFinite else { throw StoreFailure.invalidBackup }
                 events.append(event)
-            } else if record.bucket == "draft" {
-                let draft = try decoder.decode(NoteDraft.self, from: record.payload)
-                guard record.key == "editor-draft", (1...3).contains(draft.stars) else { throw StoreFailure.invalidBackup }
-                drafts += 1
-            } else {
-                throw StoreFailure.invalidBackup
+            case "draft":
+                guard record.key == "editor-draft", draft == nil else { throw StoreFailure.invalidBackup }
+                draft = try decoder.decode(NoteDraft.self, from: record.payload)
+            case "storage-meta":
+                guard record.key == "storage-meta", try decoder.decode(StoreMetadata.self, from: record.payload).formatVersion == 2 else { throw StoreFailure.unsupportedVersion }
+                metadata += 1
+            default: throw StoreFailure.invalidBackup
             }
         }
-        guard drafts <= 1, events.allSatisfy({ itemIDs.contains($0.itemID) }) else { throw StoreFailure.invalidBackup }
-        let completionIDs = Set(events.filter { $0.kind == .completed }.map(\.id))
+        guard metadata == 1 else { throw StoreFailure.invalidBackup }
+        for item in items.values {
+            if let id = item.projectID {
+                guard let project = projects[id], item.status != .active || project.status == .active else { throw StoreFailure.invalidBackup }
+            }
+            for assignment in item.projectAssignments {
+                guard assignment.changedAt.timeIntervalSince1970.isFinite,
+                      assignment.previousProjectID.map({ projects[$0] != nil }) ?? true,
+                      assignment.projectID.map({ projects[$0] != nil }) ?? true else { throw StoreFailure.invalidBackup }
+            }
+        }
+        if let draft {
+            guard (1...3).contains(draft.stars), draft.dueAt.timeIntervalSince1970.isFinite,
+                  draft.projectID.map({ projects[$0]?.status == .active }) ?? true,
+                  draft.isNew || items[draft.id]?.status == .active else { throw StoreFailure.invalidBackup }
+        }
+        guard events.allSatisfy({ items[$0.itemID] != nil }) else { throw StoreFailure.invalidBackup }
+        let completed = Dictionary(uniqueKeysWithValues: events.filter { $0.kind == .completed }.map { ($0.id, $0.itemID) })
         for event in events where event.kind == .completionUndone {
-            guard let related = event.relatedCompletionID, completionIDs.contains(related) else { throw StoreFailure.invalidBackup }
+            guard let related = event.relatedCompletionID, completed[related] == event.itemID else { throw StoreFailure.invalidBackup }
+        }
+    }
+
+    static func validate(_ project: Project) throws {
+        guard !project.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              [project.red, project.green, project.blue].allSatisfy({ $0.isFinite && (0...1).contains($0) }),
+              project.createdAt.timeIntervalSince1970.isFinite, project.updatedAt.timeIntervalSince1970.isFinite else { throw StoreFailure.invalidProject }
+        switch project.status {
+        case .active: guard project.archivedAt == nil, project.deletedAt == nil else { throw StoreFailure.invalidProject }
+        case .archived: guard project.archivedAt != nil, project.deletedAt == nil else { throw StoreFailure.invalidProject }
+        case .deleted: guard project.deletedAt != nil else { throw StoreFailure.invalidProject }
         }
     }
 
@@ -55,9 +97,9 @@ struct StoreArchive: Codable, Sendable {
         case .active:
             guard item.completedAt == nil, item.abandonedAt == nil else { throw StoreFailure.invalidItem }
         case .completed:
-            guard item.completedAt != nil, item.abandonedAt == nil else { throw StoreFailure.invalidItem }
+            guard item.completedAt?.timeIntervalSince1970.isFinite == true, item.abandonedAt == nil else { throw StoreFailure.invalidItem }
         case .abandoned:
-            guard item.abandonedAt != nil, item.completedAt == nil else { throw StoreFailure.invalidItem }
+            guard item.abandonedAt?.timeIntervalSince1970.isFinite == true, item.completedAt == nil else { throw StoreFailure.invalidItem }
         }
     }
 }
@@ -84,8 +126,7 @@ enum BackupCodec {
         let checksum = SHA256.hash(data: envelope.payload).map { String(format: "%02x", $0) }.joined()
         guard checksum == envelope.checksum else { throw StoreFailure.invalidBackup }
         let archive = try JSONDecoder().decode(StoreArchive.self, from: envelope.payload)
-        try archive.validate()
-        return archive
+        return try archive.upgraded()
     }
 }
 

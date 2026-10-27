@@ -9,7 +9,13 @@ struct PinDoApp: App {
         Window(AppConfiguration.windowTitle, id: AppConfiguration.windowID) {
             Group {
                 if let board = environment.board {
-                    BoardView(model: board).id(ObjectIdentifier(board))
+                    WorkspaceView(model: board).id(ObjectIdentifier(board))
+                } else if environment.opening {
+                    VStack(spacing: 16) {
+                        ProgressView()
+                        Text("正在检查并打开本地数据…").font(.headline)
+                    }
+                    .frame(minWidth: 760, minHeight: 560)
                 } else {
                     VStack(spacing: 18) {
                         Image(systemName: "externaldrive.badge.exclamationmark").font(.system(size: 36))

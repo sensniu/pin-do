@@ -13,7 +13,7 @@ final class RepositoryTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = AppPaths(root: root)
         var repository: TodoRepository? = try TodoRepository(paths: paths, appVersion: "0.1.0")
-        var item = TodoItem(title: "saved", notes: "完整备注", dueAt: .now.addingTimeInterval(60), stars: 3, category: .work)
+        var item = TodoItem(title: "saved", notes: "完整备注", dueAt: .now.addingTimeInterval(60), stars: 3)
         try repository!.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: .now), clearDraft: true)
         item.title = "updated"
         try repository!.commit(item, event: TodoEvent(itemID: item.id, kind: .edited, occurredAt: .now), clearDraft: true)

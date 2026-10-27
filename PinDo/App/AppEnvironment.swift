@@ -7,6 +7,7 @@ import UniformTypeIdentifiers
 final class AppEnvironment: ObservableObject {
     @Published private(set) var board: BoardModel?
     @Published private(set) var startupError: String?
+    @Published private(set) var opening = false
     @Published var notice: String?
     private(set) var repository: TodoRepository?
     private(set) var paths: AppPaths?
@@ -14,26 +15,32 @@ final class AppEnvironment: ObservableObject {
     init() { open() }
 
     func open() {
-        guard repository == nil else { return }
+        guard repository == nil, !opening else { return }
         if AppConfiguration.isPrototype {
-            board = BoardModel(items: PrototypeData.items(now: .now))
+            board = BoardModel(items: PrototypeData.items(now: .now), projects: PrototypeData.projects)
             return
         }
-        do {
-            let paths = try AppPaths.application(isDevelopment: AppConfiguration.isDevelopment)
-            self.paths = paths
-            let repository = try TodoRepository(paths: paths, appVersion: AppConfiguration.version)
-            let board = BoardModel(items: try repository.loadActiveItems(), persistence: repository)
-            board.draft = try repository.loadDraft()
-            repository.onBackupFailure = { [weak self] message in
-                self?.notice = "待办已保存，但自动备份未完成：\(message)"
+        opening = true; startupError = nil
+        Task {
+            do {
+                let paths = try AppPaths.application(isDevelopment: AppConfiguration.isDevelopment)
+                self.paths = paths
+                let version = AppConfiguration.version
+                let prepared = try await Task.detached(priority: .userInitiated) {
+                    try TodoRepository.prepareForOpening(paths: paths, appVersion: version)
+                }.value
+                let repository = TodoRepository(paths: paths, appVersion: version, prepared: prepared)
+                let data = try repository.loadBoardData()
+                let board = BoardModel(items: data.items, projects: data.projects, persistence: repository)
+                board.draft = try repository.loadDraft()
+                repository.onBackupFailure = { [weak self] message in
+                    self?.notice = "待办已保存，但自动备份未完成：\(message)"
+                }
+                self.repository = repository; self.board = board; startupError = nil
+            } catch {
+                startupError = error.localizedDescription; board = nil
             }
-            self.repository = repository
-            self.board = board
-            startupError = nil
-        } catch {
-            startupError = error.localizedDescription
-            board = nil
+            opening = false
         }
     }
 
@@ -78,7 +85,8 @@ final class AppEnvironment: ObservableObject {
             guard board?.flushDraft() == true else { return }
             try repository.restore(archive)
             board?.retireAfterRestore()
-            let board = BoardModel(items: try repository.loadActiveItems(), persistence: repository)
+            let data = try repository.loadBoardData()
+            let board = BoardModel(items: data.items, projects: data.projects, persistence: repository)
             board.draft = try repository.loadDraft()
             self.board = board
             notice = "备份已恢复。恢复前的数据位于 Backups/before-restore.pindobackup。"

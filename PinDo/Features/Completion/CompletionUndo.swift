@@ -5,6 +5,8 @@ struct CompletionUndo: Identifiable {
     let itemID: UUID
     let originalPosition: CGPoint
     let startedAt: TimeInterval
+    let scope: BoardScope
+    let item: TodoItem
     static let duration: TimeInterval = 3
 
     func remaining(at uptime: TimeInterval) -> TimeInterval {

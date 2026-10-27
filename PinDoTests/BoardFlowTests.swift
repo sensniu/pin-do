@@ -4,7 +4,7 @@ final class BoardFlowTests: XCTestCase {
     @MainActor
     final class DraftStore: TodoPersisting {
         var draft: NoteDraft?
-        func commit(_ item: TodoItem, event: TodoEvent, clearDraft: Bool) throws {}
+        func commit(_ item: TodoItem, event: TodoEvent, clearDraft: Bool) throws -> TodoItem { item }
         func saveDraft(_ draft: NoteDraft?) throws { self.draft = draft }
     }
 
@@ -25,7 +25,7 @@ final class BoardFlowTests: XCTestCase {
 
     @MainActor
     final class FailingStore: TodoPersisting {
-        func commit(_ item: TodoItem, event: TodoEvent, clearDraft: Bool) throws { throw StoreFailure.inconsistentStore }
+        func commit(_ item: TodoItem, event: TodoEvent, clearDraft: Bool) throws -> TodoItem { throw StoreFailure.inconsistentStore }
         func saveDraft(_ draft: NoteDraft?) throws { throw StoreFailure.inconsistentStore }
     }
 
