@@ -10,6 +10,63 @@ final class ProjectTests: XCTestCase {
     @MainActor private func insert(_ item: TodoItem, into store: TodoRepository) throws {
         try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: item.createdAt), clearDraft: true)
     }
+    @MainActor func testProjectColorPersistsWithSameIdentityAndBackup() throws {
+        let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        var store: TodoRepository? = try TodoRepository(paths: paths, appVersion: "0.2.0")
+        let project = try store!.createProject(name: "P")
+        let item = TodoItem(title: "keep content", dueAt: .now.addingTimeInterval(600), stars: 3, projectID: project.id)
+        try insert(item, into: store!)
+        store = nil
+        store = try TodoRepository(paths: paths, appVersion: "0.3.0")
+        let color = ProjectColor(red: 0.93, green: 0.18, blue: 0.31)
+        let updated = try store!.updateProject(id: project.id, name: "Renamed", color: color)
+        XCTAssertEqual(updated.id, project.id); XCTAssertEqual(updated.colorValue, color)
+        XCTAssertEqual(try store!.loadActiveItems(), [item])
+        let backup = try BackupCodec.decode(BackupCodec.encode(store!.archive()))
+        XCTAssertEqual(backup.formatVersion, 2)
+        XCTAssertThrowsError(try store!.updateProject(id: project.id, name: "bad", color: ProjectColor(red: 2, green: 0, blue: 0)))
+        XCTAssertEqual(try store!.loadProjects().first?.name, "Renamed")
+        _ = try store!.archiveProject(id: project.id)
+        _ = try store!.updateProject(id: project.id, name: "archived", color: ProjectColor(red: 0, green: 0, blue: 0))
+        _ = try store!.restoreProject(id: project.id)
+        XCTAssertEqual(try store!.loadProjects().first?.red, 0)
+        try store!.restore(backup)
+        store = nil
+        store = try TodoRepository(paths: paths, appVersion: "0.3.0")
+        XCTAssertEqual(try store!.loadProjects().first?.colorValue, color)
+        XCTAssertEqual(try store!.loadActiveItems(), [item])
+    }
+
+    @MainActor func testColorEditDoesNotRearrangeOrResetUndo() {
+        let project = Project(name: "P"), a = TodoItem(title: "A"), b = TodoItem(title: "B")
+        let model = BoardModel(items: [a, b], projects: [project], uptime: { 10 })
+        model.complete(a.id)
+        let layout = model.layout, receipt = model.undo?.id, revision = model.layoutRevision
+        XCTAssertTrue(model.updateProject(project.id, name: "P", color: ProjectColor(red: 1, green: 1, blue: 1)))
+        XCTAssertEqual(model.layout, layout); XCTAssertEqual(model.layoutRevision, revision)
+        XCTAssertEqual(model.undo?.id, receipt)
+        XCTAssertFalse(model.updateProject(project.id, name: "P", color: ProjectColor(red: .nan, green: 0, blue: 0)))
+        XCTAssertEqual(model.project(project.id)?.red, 1)
+        model.undoCompletion(); XCTAssertEqual(model.activeItems.count, 2)
+    }
+
+    func testTabInkContrastForDarkLightAndSaturatedColors() {
+        XCTAssertTrue(ProjectColor(red: 0, green: 0, blue: 0).usesWhiteInk)
+        XCTAssertFalse(ProjectColor(red: 1, green: 1, blue: 1).usesWhiteInk)
+        for r in stride(from: 0.0, through: 1.0, by: 0.1) {
+            for g in stride(from: 0.0, through: 1.0, by: 0.1) {
+                for b in stride(from: 0.0, through: 1.0, by: 0.1) {
+                    let color = ProjectColor(red: r, green: g, blue: b)
+                    let components = [r, g, b].map { $0 < 0.04045 ? $0 / 12.92 : pow(($0 + 0.055) / 1.055, 2.4) }
+                    let luminance = zip(components, [0.2126, 0.7152, 0.0722]).map(*).reduce(0, +)
+                    let ratio = color.usesWhiteInk ? 1.05 / (luminance + 0.05) : (luminance + 0.05) / 0.05
+                    XCTAssertGreaterThanOrEqual(ratio, 4.5)
+                }
+            }
+        }
+    }
+
     @MainActor func testBatchFailureAfterItemChangesRollsBackEveryItem() throws {
         let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
         let paths = AppPaths(root: root)
@@ -162,7 +219,7 @@ final class ProjectTests: XCTestCase {
         model.selectScope(.project(q.id)); XCTAssertEqual(model.undo?.id, receipt)
         model.selectScope(.project(p.id)); model.undoCompletion()
         XCTAssertEqual(model.layout.positions[a.id], position)
-        XCTAssertFalse(BoardLayoutEngine.frame(at: model.layout.positions[a.id]!).intersects(BoardLayoutEngine.frame(at: model.layout.positions[b.id]!)))
+        XCTAssertFalse(model.layout.frame(for: a.id)!.intersects(model.layout.frame(for: b.id)!))
         model.complete(a.id); model.selectScope(.project(q.id)); model.undoCompletion()
         XCTAssertTrue(model.visibleItems.isEmpty); XCTAssertTrue(model.activeItems.contains { $0.id == a.id })
         XCTAssertNotNil(model.notice)
@@ -181,4 +238,54 @@ final class ProjectTests: XCTestCase {
         XCTAssertEqual(model.visibleItems.map(\.id), [item.id])
         try store.archive().validate()
     }
+
+    @MainActor
+    func testAppearancePreferencesPersistRejectInvalidAndRecoverCorruption() throws {
+        let name = "PinDo.Tests.Appearance." + UUID().uuidString
+        let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        let settings = AppearanceSettings(defaults: defaults)
+        XCTAssertEqual(settings.palette, .standard)
+        var custom = NotePalette.standard
+        custom.start = ProjectColor(hex: "#112233")!
+        custom.end = ProjectColor(hex: "#FFFFFF")!
+        custom.overdue = ProjectColor(hex: "#FF0000")!
+        XCTAssertTrue(settings.save(custom))
+        XCTAssertEqual(AppearanceSettings(defaults: defaults).palette, custom)
+        var invalid = custom; invalid.start.red = .nan
+        XCTAssertFalse(settings.save(invalid))
+        XCTAssertEqual(AppearanceSettings(defaults: defaults).palette, custom)
+        defaults.set(Data("broken".utf8), forKey: AppearanceSettings.key)
+        XCTAssertEqual(AppearanceSettings(defaults: defaults).palette, .standard)
+    }
+
+    func testCustomGradientEndpointsAndFixedOverdue() {
+        let palette = NotePalette(start: ProjectColor(hex: "#000000")!, end: ProjectColor(hex: "#FFFFFF")!, overdue: ProjectColor(hex: "#FF8800")!)
+        let now = Date.now, policy = UrgencyPolicy()
+        XCTAssertEqual(palette.color(for: policy.evaluate(dueAt: now.addingTimeInterval(8 * 86400), now: now)), palette.start)
+        let near = palette.color(for: policy.evaluate(dueAt: now.addingTimeInterval(1), now: now))
+        XCTAssertGreaterThan(near.red, 0.99)
+        XCTAssertEqual(palette.color(for: policy.evaluate(dueAt: now, now: now)), palette.overdue)
+        XCTAssertEqual(palette.color(for: policy.evaluate(dueAt: now.addingTimeInterval(-99 * 86400), now: now)), palette.overdue)
+        XCTAssertNil(ProjectColor(hex: "#abcdef00"))
+        XCTAssertNil(ProjectColor(hex: "#zz0000"))
+    }
+
+    func testSecondaryInkContrastForCustomColors() {
+        func luminance(_ values: [Double]) -> Double {
+            let linear = values.map { $0 <= 0.04045 ? $0 / 12.92 : pow(($0 + 0.055) / 1.055, 2.4) }
+            return linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722
+        }
+        for r in stride(from: 0.0, through: 1.0, by: 0.2) {
+            for g in stride(from: 0.0, through: 1.0, by: 0.2) {
+                for b in stride(from: 0.0, through: 1.0, by: 0.2) {
+                    let rgb = ProjectColor(red: r, green: g, blue: b)
+                    let alpha = rgb.secondaryInkOpacity, ink = rgb.usesWhiteInk ? 1.0 : 0.0
+                    let base = luminance([r,g,b]), front = luminance([r,g,b].map { $0 * (1 - alpha) + ink * alpha })
+                    XCTAssertGreaterThanOrEqual((max(base,front) + 0.05) / (min(base,front) + 0.05), 4.5)
+                }
+            }
+        }
+    }
+
 }

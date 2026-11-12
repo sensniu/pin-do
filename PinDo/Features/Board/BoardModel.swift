@@ -5,6 +5,7 @@ import Foundation
 final class BoardModel: ObservableObject {
     @Published private(set) var items: [TodoItem]
     @Published private(set) var layout: BoardLayout
+    @Published private(set) var viewportBounds: CGRect = .zero
     @Published private(set) var layoutRevision = 0
     @Published private(set) var fitRevision = 0
     @Published private(set) var undo: CompletionUndo?
@@ -18,6 +19,31 @@ final class BoardModel: ObservableObject {
     private let uptime: () -> TimeInterval
     private var expiration: Task<Void, Never>?
     private let engine = BoardLayoutEngine()
+    private var viewport = BoardLayoutEngine.defaultViewport
+    private var measuredViewport = false
+    var scopeChanged: ((BoardScope) -> Void)?
+
+    func updateViewport(_ size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        viewport = size
+        if !measuredViewport {
+            measuredViewport = true
+            relayout()
+        }
+    }
+
+    func restoreScope(_ scope: BoardScope) {
+        selectedScope = scope.projectID.map { project($0)?.status == .active } == false ? .all : scope
+        relayout()
+    }
+
+    func completeEditing(_ value: NoteDraft) {
+        guard !value.isNew, value.canSubmit else { return }
+        submit(value)
+        guard draft == nil else { return }
+        complete(value.id)
+        if errorMessage != nil { draft = value }
+    }
     private var persistence: (any TodoPersisting)?
     private var draftSave: Task<Void, Never>?
 
@@ -32,11 +58,12 @@ final class BoardModel: ObservableObject {
         self.uptime = uptime
         self.persistence = persistence
         self.layout = BoardLayoutEngine().layout(items: items, now: date())
+        self.viewportBounds = self.layout.bounds
     }
 
     var activeItems: [TodoItem] { items.filter { $0.status == .active } }
     var visibleItems: [TodoItem] { activeItems.filter { selectedScope.includes($0) } }
-    var activeProjects: [Project] { projects.filter { $0.status == .active }.sorted { $0.createdAt < $1.createdAt } }
+    var activeProjects: [Project] { projects.filter { $0.status == .active }.sorted { $0.createdAt == $1.createdAt ? $0.id.uuidString < $1.id.uuidString : $0.createdAt < $1.createdAt } }
     var boardTitle: String {
         switch selectedScope {
         case .all: "全部待办"
@@ -61,6 +88,7 @@ final class BoardModel: ObservableObject {
             if let store = persistence as? any ProjectPersisting { apply(try store.loadBoardData()) }
             if let id = scope.projectID, project(id)?.status != .active { throw StoreFailure.invalidProject }
             selectedScope = scope
+            scopeChanged?(scope)
             relayout()
         } catch { errorMessage = error.localizedDescription }
     }
@@ -87,6 +115,17 @@ final class BoardModel: ObservableObject {
             guard var value = project(id), value.status != .deleted else { throw StoreFailure.invalidProject }
             value.name = name.trimmingCharacters(in: .whitespacesAndNewlines); value.updatedAt = date()
             try StoreArchive.validate(value); return value
+        }
+    }
+
+    func updateProject(_ id: UUID, name: String, color: ProjectColor) -> Bool {
+        mutateProject {
+            if let store = persistence as? any ProjectPersisting { return try store.updateProject(id: id, name: name, color: color) }
+            guard var value = project(id), value.status != .deleted else { throw StoreFailure.invalidProject }
+            value.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            value.red = color.red; value.green = color.green; value.blue = color.blue
+            value.updatedAt = date(); try StoreArchive.validate(value)
+            return value
         }
     }
 
@@ -127,7 +166,7 @@ final class BoardModel: ObservableObject {
                 projects[index].status = deleting ? .deleted : .archived
                 if deleting { projects[index].deletedAt = date() } else { projects[index].archivedAt = date() }
             }
-            if selectedScope == .project(id) { selectedScope = .unassigned; relayout() }
+            if selectedScope == .project(id) { selectedScope = .unassigned; scopeChanged?(.unassigned); relayout() }
         } catch { errorMessage = error.localizedDescription }
     }
 
@@ -209,7 +248,10 @@ final class BoardModel: ObservableObject {
             item.updatedAt = now
             let event = TodoEvent(itemID: item.id, kind: .edited, occurredAt: now, previousDeadline: previous.dueAt, newDeadline: item.dueAt)
             guard save(item, event: event, clearDraft: true) else { return }
-            // Editing deliberately leaves layout, bounds, and viewport unchanged.
+            if selectedScope.includes(item), previous.title != item.title || previous.notes != item.notes {
+                layout = engine.resized(layout, item: item, visibleIDs: Set(visibleItems.map(\.id)), reserved: undoReservation)
+            }
+            // No full relayout or camera change for editing; only text growth can move neighbors.
         } else {
             errorMessage = StoreFailure.staleItem.localizedDescription
             return
@@ -219,8 +261,8 @@ final class BoardModel: ObservableObject {
     }
 
     func complete(_ id: UUID) {
-        guard let index = items.firstIndex(where: { $0.id == id && $0.status == .active }),
-              let position = layout.positions[id] else { return }
+        guard let index = items.firstIndex(where: { $0.id == id && $0.status == .active }) else { return }
+        let position = layout.positions[id] ?? vacantPosition(for: items[index])
         let now = date()
         var item = items[index]
         item.status = .completed
@@ -229,7 +271,7 @@ final class BoardModel: ObservableObject {
         let event = TodoEvent(itemID: id, kind: .completed, occurredAt: now)
         guard save(item, event: event, clearDraft: false) else { return }
         let receipt = CompletionUndo(
-            id: event.id, itemID: id, originalPosition: position, startedAt: uptime(), scope: selectedScope, item: items[index]
+            id: event.id, itemID: id, originalPosition: position, originalHeight: NoteMetrics.height(for: item), startedAt: uptime(), scope: selectedScope, item: items[index]
         )
         expiration?.cancel()
         undo = receipt
@@ -258,9 +300,10 @@ final class BoardModel: ObservableObject {
         guard save(item, event: event, clearDraft: false) else { return }
         expiration?.cancel()
         if selectedScope.includes(items[index]) {
-            let point = selectedScope == receipt.scope ? receipt.originalPosition : vacantPosition()
+            let point = selectedScope == receipt.scope ? receipt.originalPosition : vacantPosition(for: items[index])
             layout.positions[receipt.itemID] = point
-            layout.bounds = layout.bounds.union(BoardLayoutEngine.frame(at: point))
+            layout.heights[receipt.itemID] = receipt.originalHeight
+            layout.bounds = layout.bounds.union(BoardLayoutEngine.frame(at: point, height: receipt.originalHeight))
         } else { notice = "已恢复到\(project(items[index].projectID)?.name ?? "未分配项目")。" }
         undo = nil
     }
@@ -277,7 +320,7 @@ final class BoardModel: ObservableObject {
         draft = nil
     }
 
-    func fitBoard() { fitRevision += 1 }
+    func fitBoard() { viewportBounds = layout.bounds; fitRevision += 1 }
 
     private func save(_ item: TodoItem, event: TodoEvent, clearDraft: Bool) -> Bool {
         do {
@@ -296,21 +339,26 @@ final class BoardModel: ObservableObject {
         }
     }
 
-    private func vacantPosition() -> CGPoint {
-        let occupied = visibleItems.compactMap { layout.positions[$0.id] }.map { BoardLayoutEngine.frame(at: $0) }
-        let placeholder = TodoItem(title: "")
-        return engine.layout(items: [placeholder], now: date(), reserved: occupied).positions[placeholder.id] ?? .zero
+    private var undoReservation: [CGRect] {
+        guard let receipt = undo, receipt.remaining(at: uptime()) > 0, receipt.scope == selectedScope else { return [] }
+        return [receipt.originalFrame]
+    }
+
+    private func vacantPosition(for item: TodoItem) -> CGPoint {
+        let occupied = visibleItems.filter { $0.id != item.id }.compactMap { layout.frame(for: $0.id) }
+        return engine.layout(items: [item], now: date(), reserved: occupied, viewport: viewport).positions[item.id] ?? .zero
     }
 
     private func relayout() {
         let reservation: [CGRect]
         if let receipt = undo, receipt.remaining(at: uptime()) > 0, receipt.scope == selectedScope {
-            reservation = [BoardLayoutEngine.frame(at: receipt.originalPosition)]
+            reservation = [receipt.originalFrame]
         } else {
             if let receipt = undo, receipt.remaining(at: uptime()) <= 0 { undo = nil }
             reservation = []
         }
-        layout = engine.layout(items: visibleItems, now: date(), reserved: reservation)
+        layout = engine.layout(items: visibleItems, now: date(), reserved: reservation, viewport: viewport)
+        viewportBounds = layout.bounds
         layoutRevision += 1
     }
 }

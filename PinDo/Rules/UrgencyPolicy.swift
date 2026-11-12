@@ -28,8 +28,34 @@ struct UrgencyPolicy: Sendable {
         default: band = .later
         }
         // Continuous, opaque color strength; the appearance is identical in both modes.
-        let intensity = 0.12 + 0.88 * (1 - min(remaining / (168 * hour), 1))
+        let nodes: [(Double, Double)] = [(0, 1), (6, 0.82), (24, 0.55), (72, 0.28), (168, 0.08)]
+        let hours = remaining / hour
+        var intensity = 0.08
+        for index in 1..<nodes.count where hours <= nodes[index].0 {
+            let a = nodes[index - 1], b = nodes[index]
+            intensity = a.1 + (b.1 - a.1) * (hours - a.0) / (b.0 - a.0)
+            break
+        }
         return Urgency(band: band, intensity: intensity)
     }
 }
 
+
+/// Relative day names use calendar boundaries, including daylight-saving transitions.
+enum DeadlineText {
+    static func label(_ date: Date?, now: Date, calendar: Calendar = .current) -> String {
+        guard let date else { return "无截止时间" }
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.locale = .current
+        formatter.dateFormat = "HH:mm"
+        let time = formatter.string(from: date)
+        if calendar.isDate(date, inSameDayAs: now) { return "今天 " + time }
+        if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now), calendar.isDate(date, inSameDayAs: tomorrow) {
+            return "明天 " + time
+        }
+        formatter.setLocalizedDateFormatFromTemplate(calendar.component(.year, from: date) == calendar.component(.year, from: now) ? "MMddHHmm" : "yyyyMMddHHmm")
+        return formatter.string(from: date)
+    }
+}

@@ -1,12 +1,18 @@
+import AppKit
 import Combine
 import SwiftUI
 
 @MainActor
 final class ProjectManagementModel: ObservableObject {
     @Published var name = ""
+    @Published var newName = ""
     @Published var editingID: UUID?
+    @Published var color = Color.blue
     @Published var deleting: Project?
     @Published var confirming = false
+    @Published var archiving: Project?
+    @Published var confirmingArchive = false
+    @Published var showArchived = false
 }
 
 struct ProjectManagementView: View {
@@ -22,27 +28,29 @@ struct ProjectManagementView: View {
                 Button("完成") { dismiss() }.keyboardShortcut(.cancelAction)
             }
             HStack {
-                TextField(form.editingID == nil ? "新项目名称" : "项目名称", text: $form.name)
-                    .onSubmit { saveName() }
-                    .accessibilityLabel("项目名称")
-                Button(form.editingID == nil ? "新建" : "保存名称") { saveName() }
-                    .disabled(form.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                if form.editingID != nil { Button("取消") { form.editingID = nil; form.name = "" } }
+                TextField("新项目名称", text: $form.newName).onSubmit { createProject() }.accessibilityLabel("新项目名称")
+                Button("新建", action: createProject).disabled(form.newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    section("当前项目", status: .active)
-                    Divider().padding(.vertical, 6)
-                    section("已归档", status: .archived)
+                VStack(alignment: .leading, spacing: 10) {
+                    section(status: .active)
+                    Divider().padding(.vertical, 8)
+                    DisclosureGroup("已归档 · \(model.projects.filter { $0.status == .archived }.count)", isExpanded: $form.showArchived) {
+                        section(status: .archived).padding(.top, 8)
+                    }
                 }
             }
-            Text("归档会将未完成事项转入未分配项目；恢复项目不会自动移回这些事项。")
-                .font(.caption).foregroundStyle(.secondary)
-            if let message = model.errorMessage {
-                Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
-            }
+            if let message = model.errorMessage { Text(message).font(.callout).foregroundStyle(.red) }
         }
         .padding(24).frame(width: 590, height: 510)
+        .alert("归档「\(form.archiving?.name ?? "")」？", isPresented: $form.confirmingArchive) {
+            Button("取消", role: .cancel) {}
+            Button("归档并转移") {
+                if let project = form.archiving { model.archiveProject(project.id); clearEditor(project.id) }
+            }
+        } message: {
+            Text("这 \(model.activeItems.filter { $0.projectID == form.archiving?.id }.count) 项未完成待办将转入未分配项目。以后恢复项目不会自动移回这些事项。")
+        }
         .alert("删除项目「\(form.deleting?.name ?? "")」？", isPresented: $form.confirming) {
             if let project = form.deleting {
                 let count = model.activeItems.filter { $0.projectID == project.id }.count
@@ -62,30 +70,50 @@ struct ProjectManagementView: View {
         }
     }
 
-    @ViewBuilder private func section(_ title: String, status: ProjectStatus) -> some View {
-        Text(title).font(.headline)
+    @ViewBuilder private func section(status: ProjectStatus) -> some View {
         let projects = model.projects.filter { $0.status == status }.sorted { $0.createdAt < $1.createdAt }
         if projects.isEmpty { Text("暂无项目").font(.caption).foregroundStyle(.secondary).padding(.vertical, 8) }
         ForEach(projects) { project in
-            HStack {
-                Circle().fill(Color(red: project.red, green: project.green, blue: project.blue)).frame(width: 8, height: 8)
-                Text(model.projectLabel(project)).lineLimit(1).help(project.name)
-                Spacer()
-                Button("重命名") { form.editingID = project.id; form.name = project.name }
-                if status == .active {
-                    Button("归档") { model.archiveProject(project.id); clearEditor(project.id) }
-                } else { Button("恢复") { model.restoreProject(project.id) } }
-                Button { form.deleting = project; form.confirming = true } label: { Image(systemName: "trash") }
-                    .help("删除项目").accessibilityLabel("删除项目：\(project.name)")
-            }
-            .font(.system(size: 13)).padding(.vertical, 5)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Circle().fill(Color(red: project.red, green: project.green, blue: project.blue)).frame(width: 10, height: 10)
+                    Text(model.projectLabel(project)).lineLimit(1).help(project.name)
+                    Spacer()
+                    Button("编辑") {
+                        form.editingID = project.id; form.name = project.name
+                        form.color = Color(red: project.red, green: project.green, blue: project.blue)
+                    }.buttonStyle(.borderless)
+                    Menu {
+                        if status == .active {
+                            Button("归档项目…") {
+                                if model.activeItems.contains(where: { $0.projectID == project.id }) {
+                                    form.archiving = project; form.confirmingArchive = true
+                                } else { model.archiveProject(project.id); clearEditor(project.id) }
+                            }
+                        } else { Button("恢复项目") { model.restoreProject(project.id) } }
+                        Divider()
+                        Button("删除项目…", role: .destructive) { form.deleting = project; form.confirming = true }
+                    } label: { Image(systemName: "ellipsis").frame(width: 24, height: 26) }
+                        .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("项目操作：\(project.name)")
+                }
+                if form.editingID == project.id {
+                    HStack {
+                        TextField("项目名称", text: $form.name).onSubmit { saveEdit() }.accessibilityLabel("项目名称")
+                        ColorPicker("项目颜色", selection: $form.color, supportsOpacity: false).labelsHidden().accessibilityLabel("项目颜色")
+                        Button("保存", action: saveEdit).disabled(form.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        Button("取消") { form.editingID = nil }
+                    }.padding(.top, 4)
+                }
+            }.font(.system(size: 13)).padding(10)
+                .background(.primary.opacity(form.editingID == project.id ? 0.04 : 0), in: RoundedRectangle(cornerRadius: 8))
         }
     }
-    private func saveName() {
-        let success = form.editingID.map { model.renameProject($0, name: form.name) } ?? model.createProject(name: form.name)
-        if success { form.editingID = nil; form.name = "" }
+    private func createProject() {
+        if model.createProject(name: form.newName) { form.newName = "" }
     }
-    private func clearEditor(_ id: UUID) {
-        if form.editingID == id { form.editingID = nil; form.name = "" }
+    private func saveEdit() {
+        guard let id = form.editingID, let color = NSColor(form.color).usingColorSpace(.sRGB) else { return }
+        if model.updateProject(id, name: form.name, color: ProjectColor(red: color.redComponent, green: color.greenComponent, blue: color.blueComponent)) { form.editingID = nil }
     }
+    private func clearEditor(_ id: UUID) { if model.errorMessage == nil, form.editingID == id { form.editingID = nil } }
 }

@@ -32,7 +32,7 @@ final class RulesTests: XCTestCase {
             }
             let result = BoardLayoutEngine().layout(items: items, now: now)
             XCTAssertEqual(result.positions.count, count)
-            let frames = result.positions.values.map(BoardLayoutEngine.frame(at:))
+            let frames = result.positions.keys.compactMap { result.frame(for: $0) }
             for first in frames.indices {
                 for second in frames.indices where second > first {
                     XCTAssertFalse(frames[first].intersects(frames[second]), "Overlapping layout at \(count)")
@@ -67,10 +67,103 @@ final class RulesTests: XCTestCase {
         let items = (0..<20).map { TodoItem(title: "\($0)", createdAt: now) }
         let result = BoardLayoutEngine().layout(items: items, now: now, reserved: [reservation])
         XCTAssertEqual(result.positions.count, items.count)
-        for point in result.positions.values {
-            XCTAssertFalse(BoardLayoutEngine.frame(at: point).intersects(reservation))
+        for id in result.positions.keys {
+            XCTAssertFalse(result.frame(for: id)!.intersects(reservation))
         }
         XCTAssertTrue(result.bounds.contains(reservation))
     }
+
+    func testWideBoardsPreferSideBySideWithoutUpscaling() {
+        let items = [TodoItem(title: "one"), TodoItem(title: "two")]
+        for viewport in [CGSize(width: 760, height: 440), CGSize(width: 1180, height: 740)] {
+            let layout = BoardLayoutEngine().layout(items: items, now: now, viewport: viewport)
+            let points = Array(layout.positions.values)
+            XCTAssertEqual(points[0].y, points[1].y)
+            XCTAssertNotEqual(points[0].x, points[1].x)
+            XCTAssertEqual(ViewportCalculator.fitScale(bounds: layout.bounds, viewport: viewport), 1)
+        }
+    }
+
+    func testExtremeViewportRatiosKeepLayoutsFiniteAndNonoverlapping() {
+        for count in [1, 2, 7] {
+            let items = (0..<count).map { TodoItem(title: "事项 \($0)") }
+            for viewport in [CGSize(width: 6000, height: 200), CGSize(width: 1, height: 6000), CGSize(width: 6000, height: 1)] {
+                let layout = BoardLayoutEngine().layout(items: items, now: now, viewport: viewport)
+                XCTAssertEqual(layout.positions.count, count)
+                let frames = items.compactMap { layout.frame(for: $0.id) }
+                for i in frames.indices {
+                    XCTAssertTrue(frames[i].midX.isFinite && frames[i].midY.isFinite)
+                    for j in frames.indices where j > i {
+                        XCTAssertFalse(BoardLayoutEngine.conflicts(frames[i], frames[j]))
+                    }
+                }
+            }
+        }
+    }
+
+    func testCalendarDayLabelsAcrossDSTAndYearBoundary() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        let today = calendar.date(from: DateComponents(year: 2026, month: 11, day: 1, hour: 0, minute: 15))!
+        let tonight = calendar.date(from: DateComponents(year: 2026, month: 11, day: 1, hour: 23, minute: 30))!
+        let tomorrow = calendar.date(from: DateComponents(year: 2026, month: 11, day: 2, hour: 0, minute: 30))!
+        XCTAssertTrue(DeadlineText.label(tonight, now: today, calendar: calendar).hasPrefix("今天"))
+        XCTAssertTrue(DeadlineText.label(tomorrow, now: today, calendar: calendar).hasPrefix("明天"))
+        let nextYear = calendar.date(from: DateComponents(year: 2027, month: 2, day: 1))!
+        XCTAssertTrue(DeadlineText.label(nextYear, now: today, calendar: calendar).contains("2027"))
+        XCTAssertEqual(DeadlineText.label(nil, now: today), "无截止时间")
+    }
+
+    func testMeasuredHeightRespectsVisibleTextAndCapsLongNotes() {
+        let short = TodoItem(title: "短标题")
+        let long = TodoItem(title: "一个需要换行显示的较长标题用于检查高度", notes: "第一行\n第二行\n第三行")
+        let huge = TodoItem(title: long.title, notes: long.notes + String(repeating: "\n后续完整内容", count: 1000))
+        XCTAssertLessThan(NoteMetrics.height(for: short), NoteMetrics.height(for: long))
+        // Truncation adds an ellipsis; font rounding can change the last line by a point.
+        XCTAssertLessThanOrEqual(abs(NoteMetrics.height(for: long) - NoteMetrics.height(for: huge)), 2)
+        for item in [short, long, huge, TodoItem(title: "👩🏽‍💻👨‍👩‍👧‍👦", notes: "a\n\nb")] {
+            XCTAssertGreaterThanOrEqual(NoteMetrics.height(for: item), NoteMetrics.minimumHeight)
+            XCTAssertLessThanOrEqual(NoteMetrics.height(for: item), NoteMetrics.maximumHeight)
+        }
+    }
+
+    func testMixedHeightLayoutAvoidsOverlapAndKeepsPriorityDistance() {
+        let items = (0..<45).map { index in
+            TodoItem(title: "事项 \(index)", notes: index % 3 == 0 ? "长备注的第一行\n第二行\n第三行" : "",
+                     dueAt: now.addingTimeInterval(Double(index - 10) * 3600), stars: index % 3 + 1)
+        }
+        let result = BoardLayoutEngine().layout(items: items, now: now)
+        let frames = items.compactMap { result.frame(for: $0.id) }
+        for i in frames.indices { for j in frames.indices where j > i {
+            XCTAssertFalse(BoardLayoutEngine.conflicts(frames[i], frames[j]))
+        } }
+        let distances = TodoOrdering().sorted(items, now: now).map { item in
+            let point = result.positions[item.id]!
+            return point.x * point.x + point.y * point.y
+        }
+        for i in 1..<distances.count { XCTAssertGreaterThanOrEqual(distances[i] + 0.02, distances[i - 1]) }
+    }
+
+    func testGrowthOnlyMovesCollidingNeighborsAndShrinkDoesNotPullThemBack() {
+        var first = TodoItem(title: "first")
+        let second = TodoItem(title: "second"), third = TodoItem(title: "third"), beside = TodoItem(title: "beside")
+        let items = [first, second, third, beside]
+        var before = BoardLayout()
+        for (item, point) in zip(items, [CGPoint.zero, CGPoint(x: 0, y: 128), CGPoint(x: 0, y: 256), CGPoint(x: 228, y: 0)]) {
+            before.positions[item.id] = point; before.heights[item.id] = NoteMetrics.height(for: item)
+        }
+        first.notes = "第一行\n第二行\n第三行"
+        let ids = Set(items.map(\.id))
+        let after = BoardLayoutEngine().resized(before, item: first, visibleIDs: ids, reserved: [])
+        XCTAssertEqual(after.frame(for: first.id)!.minY, before.frame(for: first.id)!.minY)
+        XCTAssertGreaterThan(after.positions[second.id]!.y, before.positions[second.id]!.y)
+        XCTAssertGreaterThan(after.positions[third.id]!.y, before.positions[third.id]!.y)
+        XCTAssertEqual(after.positions[beside.id], before.positions[beside.id])
+        first.notes = ""
+        let shrunk = BoardLayoutEngine().resized(after, item: first, visibleIDs: ids, reserved: [])
+        XCTAssertEqual(shrunk.positions[second.id], after.positions[second.id])
+        XCTAssertEqual(shrunk.positions[third.id], after.positions[third.id])
+    }
+
 }
 

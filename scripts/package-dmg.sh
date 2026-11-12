@@ -18,20 +18,20 @@ mkdir -p "$task_root/build/releases" "$task_root/build/Packaging"
 task_staging=$(mktemp -d "$task_root/build/Packaging/PinDo.XXXXXX")
 task_raw="$task_staging.iso"
 function task_cleanup() {
-    # Exact mktemp directory only; find does not follow the Applications symlink.
+    # Exact mktemp directory only; no user data is ever staged.
     /usr/bin/find "$task_staging" -depth -delete
     if [[ -f "$task_raw" ]]; then /usr/bin/find "$task_raw" -delete; fi
 }
 trap task_cleanup EXIT
 /usr/bin/ditto "$task_app" "$task_staging/PinDo.app"
-/bin/ln -s /Applications "$task_staging/Applications"
+xcrun swift -module-cache-path "$task_root/build/ModuleCache" "$task_root/scripts/CreateApplicationsAlias.swift" "$task_staging/应用程序.alias"
+/usr/bin/codesign --verify --deep --strict "$task_staging/PinDo.app"
 /bin/cp "$task_root/INSTALL.md" "$task_staging/安装与数据说明.md"
 task_output="$task_root/build/releases/PinDo-${task_version}-arm64.dmg"
 if ! /usr/bin/hdiutil create -volname "PinDo v${task_version}" -srcfolder "$task_staging" \
     -format UDZO -ov "$task_output"; then
     # UDF creation avoids temporary device mounts and HFS catalog FinderInfo on signed bundles.
-    # macOS cannot resolve this absolute symlink on UDF; use Finder's Applications folder instead.
-    /usr/bin/find "$task_staging/Applications" -type l -delete
+    # A Finder bookmark alias remains resolvable on UDF (unlike an absolute symlink).
     /usr/bin/hdiutil makehybrid -udf -udf-volume-name "PinDo v${task_version}" \
         -o "$task_raw" "$task_staging" -ov
     /usr/bin/hdiutil convert "$task_raw" -format UDZO -o "$task_output" -ov

@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import Combine
 import Foundation
 import UniformTypeIdentifiers
@@ -9,10 +10,18 @@ final class AppEnvironment: ObservableObject {
     @Published private(set) var startupError: String?
     @Published private(set) var opening = false
     @Published var notice: String?
+    @Published var managingProjects = false
+    @Published var managingAppearance = false
+    let appearance = AppearanceSettings()
+    // Transient development preview; Release always follows the system.
+    @Published var previewScheme: ColorScheme?
     private(set) var repository: TodoRepository?
     private(set) var paths: AppPaths?
 
-    init() { open() }
+    init() {
+        for key in ["projects.sidebar.pinned", "projects.sidebar.width"] { UserDefaults.standard.removeObject(forKey: key) }
+        open()
+    }
 
     func open() {
         guard repository == nil, !opening else { return }
@@ -32,6 +41,7 @@ final class AppEnvironment: ObservableObject {
                 let repository = TodoRepository(paths: paths, appVersion: version, prepared: prepared)
                 let data = try repository.loadBoardData()
                 let board = BoardModel(items: data.items, projects: data.projects, persistence: repository)
+                self.configureScope(board)
                 board.draft = try repository.loadDraft()
                 repository.onBackupFailure = { [weak self] message in
                     self?.notice = "待办已保存，但自动备份未完成：\(message)"
@@ -41,6 +51,16 @@ final class AppEnvironment: ObservableObject {
                 startupError = error.localizedDescription; board = nil
             }
             opening = false
+        }
+    }
+
+    private func configureScope(_ board: BoardModel) {
+        let saved = UserDefaults.standard.string(forKey: "workspace.lastScope") ?? "all"
+        let scope: BoardScope = saved == "unassigned" ? .unassigned : UUID(uuidString: saved).map(BoardScope.project) ?? .all
+        board.restoreScope(scope)
+        board.scopeChanged = { value in
+            let key = value.projectID?.uuidString ?? (value == .unassigned ? "unassigned" : "all")
+            UserDefaults.standard.set(key, forKey: "workspace.lastScope")
         }
     }
 
@@ -87,6 +107,7 @@ final class AppEnvironment: ObservableObject {
             board?.retireAfterRestore()
             let data = try repository.loadBoardData()
             let board = BoardModel(items: data.items, projects: data.projects, persistence: repository)
+            configureScope(board)
             board.draft = try repository.loadDraft()
             self.board = board
             notice = "备份已恢复。恢复前的数据位于 Backups/before-restore.pindobackup。"

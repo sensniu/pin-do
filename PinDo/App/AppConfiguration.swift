@@ -1,7 +1,7 @@
 import Foundation
 
 enum AppConfiguration {
-    static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0"
+    static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.5.0"
     static let isPrototype = ProcessInfo.processInfo.arguments.contains("--demo")
     static var isDevelopment: Bool {
         #if DEBUG

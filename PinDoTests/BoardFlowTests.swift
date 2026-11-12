@@ -92,9 +92,9 @@ final class BoardFlowTests: XCTestCase {
         draft.title = "new"
         model.submit(draft)
         XCTAssertEqual(model.layoutRevision, 1)
-        let reserved = BoardLayoutEngine.frame(at: original)
-        for position in model.layout.positions.values {
-            XCTAssertFalse(BoardLayoutEngine.frame(at: position).intersects(reserved))
+        let reserved = model.undo!.originalFrame
+        for id in model.layout.positions.keys {
+            XCTAssertFalse(model.layout.frame(for: id)!.intersects(reserved))
         }
         model.undoCompletion()
         XCTAssertEqual(model.layout.positions[first.id], original)
@@ -131,5 +131,102 @@ final class BoardFlowTests: XCTestCase {
         XCTAssertEqual(model.items.first?.title, "new")
         XCTAssertEqual(model.items.first?.stars, 3)
     }
+
+    @MainActor
+    func testWindowResizeDoesNotRearrangeUntilNextAllowedTrigger() {
+        let items = (0..<12).map { TodoItem(title: "\($0)") }
+        let model = BoardModel(items: items)
+        model.updateViewport(CGSize(width: 1120, height: 680))
+        let before = model.layout
+        let revision = model.layoutRevision
+        model.updateViewport(CGSize(width: 680, height: 1100))
+        XCTAssertEqual(model.layout, before)
+        XCTAssertEqual(model.layoutRevision, revision)
+        model.selectScope(.all)
+        XCTAssertNotEqual(model.layout, before)
+        XCTAssertEqual(model.layoutRevision, revision + 1)
+    }
+
+    @MainActor
+    func testRestoredScopeAndDraftCompletionFromAnotherBoard() {
+        let project = Project(name: "project", color: 0)
+        let item = TodoItem(title: "unassigned")
+        let model = BoardModel(items: [item], projects: [project], uptime: { 10 })
+        model.restoreScope(.project(project.id))
+        XCTAssertEqual(model.selectedScope, .project(project.id))
+        XCTAssertTrue(model.visibleItems.isEmpty)
+        var draft = NoteDraft(item: item, now: .now)
+        draft.title = "saved before completion"
+        model.draft = draft
+        model.completeEditing(draft)
+        XCTAssertNil(model.draft)
+        XCTAssertEqual(model.items[0].status, .completed)
+        XCTAssertEqual(model.items[0].title, draft.title)
+        model.undoCompletion()
+        XCTAssertEqual(model.items[0].status, .active)
+        XCTAssertNil(model.items[0].projectID)
+        model.restoreScope(.project(UUID()))
+        XCTAssertEqual(model.selectedScope, .all)
+    }
+
+    @MainActor
+    func testEditorCompletionFailureKeepsDraftAndActiveItem() {
+        let item = TodoItem(title: "keep")
+        let model = BoardModel(items: [item], persistence: FailingStore())
+        var draft = NoteDraft(item: item, now: .now)
+        draft.title = "unsaved"
+        model.draft = draft
+        model.completeEditing(draft)
+        XCTAssertEqual(model.draft, draft)
+        XCTAssertEqual(model.activeItems, [item])
+        XCTAssertNil(model.undo)
+    }
+
+    @MainActor
+    func testCompletionFailureAfterSuccessfulEditRestoresEditor() {
+        final class Store: TodoPersisting {
+            var commits = 0
+            func saveDraft(_ draft: NoteDraft?) throws {}
+            func commit(_ item: TodoItem, event: TodoEvent, clearDraft: Bool) throws -> TodoItem {
+                commits += 1
+                if commits == 2 { throw StoreFailure.inconsistentStore }
+                return item
+            }
+        }
+        let item = TodoItem(title: "original")
+        let model = BoardModel(items: [item], persistence: Store())
+        var draft = NoteDraft(item: item, now: .now)
+        draft.title = "edited"
+        model.draft = draft
+        model.completeEditing(draft)
+        XCTAssertEqual(model.draft, draft)
+        XCTAssertEqual(model.items[0].title, "edited")
+        XCTAssertEqual(model.items[0].status, .active)
+        XCTAssertNil(model.undo)
+        XCTAssertNotNil(model.errorMessage)
+    }
+
+    @MainActor
+    func testTextResizePreservesViewportRevisionAndUndoReservation() {
+        let items = (0..<12).map { TodoItem(title: "item \($0)") }
+        let model = BoardModel(items: items, uptime: { 10 })
+        let completed = items[3]
+        let point = model.layout.positions[completed.id]
+        model.complete(completed.id)
+        let viewport = model.viewportBounds, revision = model.layoutRevision
+        var draft = NoteDraft(item: items[0], now: .now)
+        draft.title = "这里是用于测试自动换行的很长的事项标题"
+        draft.notes = "备注第一行\n第二行\n第三行"
+        model.submit(draft)
+        XCTAssertEqual(model.viewportBounds, viewport)
+        XCTAssertEqual(model.layoutRevision, revision)
+        let reservation = model.undo!.originalFrame
+        for item in model.visibleItems { XCTAssertFalse(model.layout.frame(for: item.id)!.intersects(reservation)) }
+        model.undoCompletion()
+        XCTAssertEqual(model.layout.positions[completed.id], point)
+        let frames = model.visibleItems.compactMap { model.layout.frame(for: $0.id) }
+        for i in frames.indices { for j in frames.indices where j > i { XCTAssertFalse(frames[i].intersects(frames[j])) } }
+    }
+
 }
 

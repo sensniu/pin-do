@@ -4,24 +4,17 @@ struct NoteAppearance {
     let urgency: Urgency
     let scheme: ColorScheme
 
-    var fill: Color {
+    var palette: NotePalette = .standard
+    var paper: ProjectColor {
         if urgency.band == .noDeadline {
-            return scheme == .dark ? Color(white: 0.21) : Color(white: 0.94)
+            let gray = scheme == .dark ? 0.24 : 0.96
+            return ProjectColor(red: gray, green: gray, blue: gray)
         }
-        if urgency.isOverdue { return Color(red: 0.96, green: 0.73, blue: 0.69) }
-        let intensity = urgency.intensity
-        return Color(
-            red: 0.96 - 0.23 * intensity,
-            green: 0.94 - 0.40 * intensity,
-            blue: 0.99 - 0.06 * intensity
-        )
+        return palette.color(for: urgency)
     }
-
-    var ink: Color {
-        if urgency.band == .noDeadline && scheme == .dark { return .white }
-        // Colored paper stays light in both modes, so black keeps it legible.
-        return .black
-    }
+    var fill: Color { Color(red: paper.red, green: paper.green, blue: paper.blue) }
+    var ink: Color { paper.usesWhiteInk ? .white : .black }
+    var secondaryOpacity: Double { paper.secondaryInkOpacity }
 
     func border(project: Project?) -> Color {
         guard let project else { return ink.opacity(0.12) }
@@ -47,3 +40,10 @@ struct StarsView: View {
     }
 }
 
+
+/// Shared neutral surfaces. Deadline and project colors keep their own meaning.
+enum WorkspaceStyle {
+    static func canvas(_ scheme: ColorScheme) -> Color {
+        scheme == .dark ? Color(red: 0.098, green: 0.102, blue: 0.118) : Color(red: 0.969, green: 0.969, blue: 0.976)
+    }
+}

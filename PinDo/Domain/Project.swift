@@ -5,9 +5,9 @@ enum ProjectStatus: String, Codable, Sendable { case active, archived, deleted }
 struct Project: Identifiable, Codable, Equatable, Sendable {
     let id: UUID
     var name: String
-    let red: Double
-    let green: Double
-    let blue: Double
+    var red: Double
+    var green: Double
+    var blue: Double
     var status: ProjectStatus = .active
     let createdAt: Date
     var updatedAt: Date
@@ -52,4 +52,22 @@ struct ProjectAssignment: Codable, Equatable, Sendable {
     let projectID: UUID?
     let changedAt: Date
     let reason: Reason
+}
+
+struct ProjectColor: Codable, Equatable, Sendable {
+    var red: Double
+    var green: Double
+    var blue: Double
+
+    var usesWhiteInk: Bool {
+        func linear(_ value: Double) -> Double {
+            value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
+        }
+        let luminance = 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+        return (1.05 / (luminance + 0.05)) >= ((luminance + 0.05) / 0.05)
+    }
+}
+
+extension Project {
+    var colorValue: ProjectColor { ProjectColor(red: red, green: green, blue: blue) }
 }

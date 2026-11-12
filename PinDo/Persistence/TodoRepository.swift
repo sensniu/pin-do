@@ -12,6 +12,7 @@ protocol TodoPersisting: AnyObject {
 protocol ProjectPersisting: TodoPersisting {
     func loadBoardData() throws -> BoardData
     func createProject(name: String) throws -> Project
+    func updateProject(id: UUID, name: String, color: ProjectColor) throws -> Project
     func renameProject(id: UUID, name: String) throws -> Project
     func archiveProject(id: UUID) throws -> BoardData
     func restoreProject(id: UUID) throws -> Project
@@ -245,6 +246,15 @@ final class TodoRepository: ProjectPersisting {
         var value = try project(id)
         guard value.status != .deleted else { throw StoreFailure.invalidProject }
         value.name = name.trimmingCharacters(in: .whitespacesAndNewlines); value.updatedAt = .now
+        return try saveProject(value)
+    }
+
+    func updateProject(id: UUID, name: String, color: ProjectColor) throws -> Project {
+        var value = try project(id)
+        guard value.status != .deleted else { throw StoreFailure.invalidProject }
+        value.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        value.red = color.red; value.green = color.green; value.blue = color.blue
+        value.updatedAt = .now
         return try saveProject(value)
     }
 

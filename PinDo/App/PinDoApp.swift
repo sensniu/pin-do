@@ -9,7 +9,7 @@ struct PinDoApp: App {
         Window(AppConfiguration.windowTitle, id: AppConfiguration.windowID) {
             Group {
                 if let board = environment.board {
-                    WorkspaceView(model: board).id(ObjectIdentifier(board))
+                    WorkspaceView(model: board, managingProjects: $environment.managingProjects, managingAppearance: $environment.managingAppearance).id(ObjectIdentifier(board))
                 } else if environment.opening {
                     VStack(spacing: 16) {
                         ProgressView()
@@ -32,6 +32,8 @@ struct PinDoApp: App {
                     .frame(minWidth: 760, minHeight: 560).padding(30)
                 }
             }
+            .environmentObject(environment.appearance)
+            .preferredColorScheme(environment.previewScheme)
             .onAppear { delegate.environment = environment }
             .alert("PinDo", isPresented: Binding(
                 get: { environment.notice != nil },
@@ -43,15 +45,34 @@ struct PinDoApp: App {
         .defaultSize(width: 1180, height: 850)
         .windowResizability(.contentMinSize)
         .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("外观设置…") { environment.managingAppearance = true }
+                    .keyboardShortcut(",")
+                    .disabled(environment.board == nil || environment.board?.draft != nil || environment.managingProjects || environment.managingAppearance)
+            }
+            #if DEBUG
+            CommandMenu("开发预览") {
+                Button("跟随系统") { environment.previewScheme = nil }
+                Button("浅色外观") { environment.previewScheme = .light }
+                Button("深色外观") { environment.previewScheme = .dark }
+                Divider()
+                Button("紧凑窗口") { NSApp.keyWindow?.setContentSize(NSSize(width: 760, height: 560)) }
+                Button("默认窗口") { NSApp.keyWindow?.setContentSize(NSSize(width: 1180, height: 850)) }
+            }
+            #endif
             CommandGroup(replacing: .newItem) {
                 Button("新增待办") { environment.board?.beginNew() }
                     .keyboardShortcut("n")
-                    .disabled(environment.board == nil || environment.board?.draft != nil)
+                    .disabled(environment.board == nil || environment.board?.draft != nil || environment.managingProjects || environment.managingAppearance)
             }
             CommandMenu("白板") {
                 Button("适应白板") { environment.board?.fitBoard() }
                     .keyboardShortcut("0")
-                    .disabled(environment.board == nil || environment.board?.draft != nil)
+                    .disabled(environment.board == nil || environment.board?.draft != nil || environment.managingProjects || environment.managingAppearance)
+            }
+            CommandMenu("项目") {
+                Button("项目管理…") { environment.managingProjects = true }
+                    .disabled(environment.board == nil || environment.board?.draft != nil || environment.managingProjects || environment.managingAppearance)
             }
             CommandMenu("数据") {
                 Button("导出备份…") { environment.exportBackup() }
