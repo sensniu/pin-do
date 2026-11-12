@@ -9,6 +9,7 @@ struct NoteDraft: Identifiable, Codable, Equatable, Sendable {
     var dueAt: Date
     var stars: Int
     var projectID: UUID?
+    var syncBaseline: SyncBaseline? = nil
 
     init(item: TodoItem? = nil, now: Date) {
         id = item?.id ?? UUID()

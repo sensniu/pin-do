@@ -5,7 +5,14 @@ import SwiftData
 @MainActor
 protocol TodoPersisting: AnyObject {
     @discardableResult func commit(_ item: TodoItem, event: TodoEvent, clearDraft: Bool) throws -> TodoItem
+    @discardableResult func commitDraft(_ item: TodoItem, event: TodoEvent, draft: NoteDraft) throws -> TodoItem
     func saveDraft(_ draft: NoteDraft?) throws
+}
+
+extension TodoPersisting {
+    @discardableResult func commitDraft(_ item: TodoItem, event: TodoEvent, draft: NoteDraft) throws -> TodoItem {
+        try commit(item, event: event, clearDraft: true)
+    }
 }
 
 @MainActor
@@ -30,11 +37,12 @@ final class PreparedStore: Sendable {
 final class TodoRepository: ProjectPersisting {
     let paths: AppPaths
     private let container: ModelContainer
-    private let context: ModelContext
+    let context: ModelContext
     private let backupService: Task<BackupService, Never>
     private let prepared: PreparedStore
     private let appVersion: String
     private var backupTask: Task<Void, Never>?
+    var onBusinessChange: (() -> Void)?
     var onBackupFailure: ((String) -> Void)?
 
     convenience init(paths: AppPaths, appVersion: String) throws {
@@ -68,7 +76,7 @@ final class TodoRepository: ProjectPersisting {
         var manifest: StoreManifest
         if hasManifest {
             manifest = try JSONDecoder().decode(StoreManifest.self, from: Data(contentsOf: paths.manifest))
-            guard (1...2).contains(manifest.formatVersion), appVersion.compare(manifest.lastAppVersion, options: .numeric) != .orderedAscending else { throw StoreFailure.unsupportedVersion }
+            guard (1...3).contains(manifest.formatVersion), appVersion.compare(manifest.lastAppVersion, options: .numeric) != .orderedAscending else { throw StoreFailure.unsupportedVersion }
             guard hasStore || (manifest.migrationPending == true && manifest.upgradeSnapshot == nil && manifest.formatVersion == 2) else { throw StoreFailure.inconsistentStore }
             if let snapshot = manifest.upgradeSnapshot {
                 guard manifest.migrationPending == true, snapshot.hasPrefix("before-upgrade-"), !snapshot.contains("/"), !snapshot.contains("..") else { throw StoreFailure.inconsistentStore }
@@ -112,16 +120,21 @@ final class TodoRepository: ProjectPersisting {
             context.insert(StoreRecord(key: meta.key, bucket: meta.bucket, payload: meta.payload))
             try context.save()
         } else {
-            guard manifest.formatVersion == 2, metadata.count == 1, metadata[0].bucket == "storage-meta", try JSONDecoder().decode(StoreMetadata.self, from: metadata[0].payload).formatVersion == 2 else { throw StoreFailure.unsupportedVersion }
-            if manifest.migrationPending == true {
-                let archive = StoreArchive(appVersion: appVersion, createdAt: .now,
+            guard [2, 3].contains(manifest.formatVersion), metadata.count == 1, metadata[0].bucket == "storage-meta" else { throw StoreFailure.unsupportedVersion }
+            let diskVersion = try JSONDecoder().decode(StoreMetadata.self, from: metadata[0].payload).formatVersion
+            guard [2, 3].contains(diskVersion), diskVersion >= manifest.formatVersion else { throw StoreFailure.unsupportedVersion }
+            manifest.formatVersion = diskVersion
+            if manifest.migrationPending == true || diskVersion == 3 {
+                var archive = StoreArchive(appVersion: appVersion, createdAt: .now,
                                            records: all.map { StoredValue(key: $0.key, bucket: $0.bucket, payload: $0.payload) })
+                archive.formatVersion = diskVersion
                 try archive.validate()
-            } else if manifest.lastAppVersion != appVersion {
+            }
+            if manifest.lastAppVersion != appVersion {
                 _ = try backupClosedStore(paths: paths)
             }
         }
-        manifest.formatVersion = 2; manifest.lastAppVersion = appVersion
+        manifest.lastAppVersion = appVersion
         manifest.migrationPending = nil; manifest.upgradeSnapshot = nil
         try JSONEncoder().encode(manifest).write(to: paths.manifest, options: .atomic)
         return container
@@ -168,15 +181,23 @@ final class TodoRepository: ProjectPersisting {
         guard let row = try record(key: "editor-draft") else { return nil }
         let draft = try JSONDecoder().decode(NoteDraft.self, from: row.payload)
         guard (1...3).contains(draft.stars), draft.dueAt.timeIntervalSince1970.isFinite else { throw StoreFailure.inconsistentStore }
-        if let id = draft.projectID, try project(id).status != .active { throw StoreFailure.inconsistentStore }
+        if let id = draft.projectID { _ = try project(id) }
         if !draft.isNew {
-            guard let row = try record(key: "todo:\(draft.id.uuidString)"), row.bucket == "todo-active" else { throw StoreFailure.inconsistentStore }
+            guard let row = try record(key: "todo:\(draft.id.uuidString)"), row.bucket.hasPrefix("todo-") else { throw StoreFailure.inconsistentStore }
         }
         return draft
     }
 
     @discardableResult func commit(_ incoming: TodoItem, event: TodoEvent, clearDraft: Bool) throws -> TodoItem {
+        try commitInternal(incoming, event: event, clearDraft: clearDraft, baseline: nil)
+    }
+    @discardableResult func commitDraft(_ item: TodoItem, event: TodoEvent, draft: NoteDraft) throws -> TodoItem {
+        try commitInternal(item, event: event, clearDraft: true, baseline: draft.syncBaseline)
+    }
+    private func commitInternal(_ incoming: TodoItem, event: TodoEvent, clearDraft: Bool, baseline: SyncBaseline?) throws -> TodoItem {
+        let syncBefore = try syncContentsIfEnabled()
         var item = incoming
+        var event = event
         try StoreArchive.validate(item)
         guard event.itemID == item.id else { throw StoreFailure.invalidItem }
         do {
@@ -190,21 +211,35 @@ final class TodoRepository: ProjectPersisting {
                 guard let existing else { throw StoreFailure.staleItem }
                 prior = try JSONDecoder().decode(TodoItem.self, from: existing.payload)
                 let required: TodoStatus = event.kind == .completionUndone ? .completed : .active
-                guard prior?.status == required else { throw StoreFailure.staleItem }
+                guard prior?.status == required || (event.kind == .edited && baseline != nil && syncBefore != nil) else { throw StoreFailure.staleItem }
+                if event.kind == .edited, baseline != nil, let prior {
+                    item.status = prior.status; item.completedAt = prior.completedAt; item.abandonedAt = prior.abandonedAt
+                    if let baseline {
+                        // History describes this edit's actual intent, not stale values from untouched controls.
+                        let changedDeadline = incoming.dueAt != baseline.item.dueAt
+                        event.previousDeadline = changedDeadline ? baseline.item.dueAt : prior.dueAt
+                        event.newDeadline = changedDeadline ? incoming.dueAt : prior.dueAt
+                    }
+                }
                 let expected: TodoStatus = event.kind == .completed ? .completed : (event.kind == .abandoned ? .abandoned : .active)
-                guard item.status == expected, prior?.createdAt == item.createdAt else { throw StoreFailure.staleItem }
+                guard (item.status == expected || (event.kind == .edited && baseline != nil)), prior?.createdAt == item.createdAt else { throw StoreFailure.staleItem }
                 item.projectAssignments = prior!.projectAssignments
             }
             if let id = item.projectID {
                 let target = try project(id)
                 if item.status == .active && target.status != .active {
-                    guard event.kind == .completionUndone else { throw StoreFailure.invalidProject }
-                    item.projectID = nil
+                    guard event.kind == .completionUndone || baseline != nil else { throw StoreFailure.invalidProject }
+                    // Leave unchanged draft membership to the generation projection; it is not a manual move.
+                    if baseline == nil || incoming.projectID != baseline?.item.projectID { item.projectID = nil }
                 }
             }
-            if let prior, prior.projectID != item.projectID {
-                item.projectAssignments.append(ProjectAssignment(previousProjectID: prior.projectID, projectID: item.projectID,
-                    changedAt: item.updatedAt, reason: event.kind == .completionUndone ? .completionRestored : .manual))
+            if let prior {
+                let previousProject = baseline != nil ? baseline!.item.projectID : prior.projectID
+                let intendedProject = baseline != nil ? incoming.projectID : item.projectID
+                if previousProject != intendedProject {
+                    item.projectAssignments.append(ProjectAssignment(previousProjectID: previousProject, projectID: item.projectID,
+                        changedAt: item.updatedAt, reason: event.kind == .completionUndone ? .completionRestored : .manual))
+                }
             }
             guard try record(key: "event:\(event.id.uuidString)") == nil else { throw StoreFailure.staleItem }
             if event.kind == .completionUndone {
@@ -215,10 +250,12 @@ final class TodoRepository: ProjectPersisting {
             try put(item)
             context.insert(StoreRecord(key: "event:\(event.id.uuidString)", bucket: "event", payload: try JSONEncoder().encode(event)))
             if clearDraft, let draft = try record(key: "editor-draft") { context.delete(draft) }
+            try captureSync(syncBefore, baseline: baseline)
             try context.save()
         } catch { context.rollback(); throw error }
         scheduleBackup()
-        return item
+        onBusinessChange?()
+        return try storedItem(item.id) ?? item
     }
 
     func saveDraft(_ draft: NoteDraft?) throws {
@@ -230,7 +267,7 @@ final class TodoRepository: ProjectPersisting {
         let row = try record(key: "editor-draft")
         if let draft {
             guard (1...3).contains(draft.stars), draft.dueAt.timeIntervalSince1970.isFinite else { throw StoreFailure.invalidItem }
-            if let id = draft.projectID, try project(id).status != .active { throw StoreFailure.invalidProject }
+            if let id = draft.projectID { _ = try project(id) }
             let data = try JSONEncoder().encode(draft)
             if let row { row.payload = data }
             else { context.insert(StoreRecord(key: "editor-draft", bucket: "draft", payload: data)) }
@@ -266,14 +303,16 @@ final class TodoRepository: ProjectPersisting {
     }
 
     private func saveProject(_ value: Project) throws -> Project {
-        do { try put(value); try context.save() } catch { context.rollback(); throw error }
-        scheduleBackup(); return value
+        let before = try syncContentsIfEnabled()
+        do { try put(value); try captureSync(before); try context.save() } catch { context.rollback(); throw error }
+        scheduleBackup(); onBusinessChange?(); return try project(value.id)
     }
 
     func archiveProject(id: UUID) throws -> BoardData { try changeProject(id: id, deleting: false, action: .transferToUnassigned) }
     func deleteProject(id: UUID, action: UnfinishedProjectAction) throws -> BoardData { try changeProject(id: id, deleting: true, action: action) }
 
     private func changeProject(id: UUID, deleting: Bool, action: UnfinishedProjectAction) throws -> BoardData {
+        let before = try syncContentsIfEnabled()
         do {
             var value = try project(id)
             guard value.status == .active || (deleting && value.status == .archived) else { throw StoreFailure.invalidProject }
@@ -300,23 +339,24 @@ final class TodoRepository: ProjectPersisting {
             value.status = deleting ? .deleted : .archived; value.updatedAt = now
             if deleting { value.deletedAt = now } else { value.archivedAt = now }
             try put(value)
+            try captureSync(before)
             let output = try loadBoardData()
             try context.save()
-            scheduleBackup(); return output
+            scheduleBackup(); onBusinessChange?(); return output
         } catch { context.rollback(); throw error }
     }
 
-    private func project(_ id: UUID) throws -> Project {
+    func project(_ id: UUID) throws -> Project {
         guard let row = try record(key: "project:\(id.uuidString)"), row.bucket == "project" else { throw StoreFailure.invalidProject }
         return try JSONDecoder().decode(Project.self, from: row.payload)
     }
-    private func put(_ value: Project) throws {
+    func put(_ value: Project) throws {
         try StoreArchive.validate(value)
         let data = try JSONEncoder().encode(value)
         if let row = try record(key: "project:\(value.id.uuidString)") { row.payload = data }
         else { context.insert(StoreRecord(key: "project:\(value.id.uuidString)", bucket: "project", payload: data)) }
     }
-    private func put(_ item: TodoItem) throws {
+    func put(_ item: TodoItem) throws {
         try StoreArchive.validate(item)
         let data = try JSONEncoder().encode(item), key = "todo:\(item.id.uuidString)"
         if let row = try record(key: key) { row.payload = data; row.bucket = "todo-\(item.status.rawValue)" }
@@ -324,22 +364,36 @@ final class TodoRepository: ProjectPersisting {
     }
 
     func archive() throws -> StoreArchive {
-        let archive = StoreArchive(appVersion: appVersion, createdAt: .now, records: try context.fetch(FetchDescriptor<StoreRecord>()).map {
+        var archive = StoreArchive(appVersion: appVersion, createdAt: .now, records: try context.fetch(FetchDescriptor<StoreRecord>()).map {
             StoredValue(key: $0.key, bucket: $0.bucket, payload: $0.payload)
         })
+        archive.formatVersion = try syncState() == nil ? 2 : 3
         try archive.validate(); return archive
     }
 
     func restore(_ incoming: StoreArchive) throws {
         let archive = try incoming.upgraded()
+        if try syncState() != nil { try mergeSyncBackup(archive); return }
         let before = try BackupCodec.encode(self.archive())
         try FileManager.default.createDirectory(at: paths.backups, withIntermediateDirectories: true)
         try before.write(to: paths.backups.appendingPathComponent("before-restore.pindobackup"), options: .atomic)
         do {
             for row in try context.fetch(FetchDescriptor<StoreRecord>()) { context.delete(row) }
             for record in archive.records { context.insert(StoreRecord(key: record.key, bucket: record.bucket, payload: record.payload)) }
+            if var restored = try syncState() {
+                restored.writerID = UUID(); restored.enabled = false
+                restored.outgoing = SyncCursor(); restored.pending = nil
+                restored.cursors = [:]; restored.received = [:]; restored.published = []
+                restored.outboxIDs = Set(restored.changes.map(\.id)); restored.lastSuccess = nil
+                try putRestoredSyncState(restored)
+            }
             try context.save()
         } catch { context.rollback(); throw error }
+        if archive.formatVersion == 3 {
+            var manifest = try JSONDecoder().decode(StoreManifest.self, from: Data(contentsOf: paths.manifest))
+            manifest.formatVersion = 3
+            try JSONEncoder().encode(manifest).write(to: paths.manifest, options: .atomic)
+        }
         scheduleBackup()
     }
 
@@ -349,7 +403,7 @@ final class TodoRepository: ProjectPersisting {
         try await worker.writeAutomaticBackup(to: paths.backups, appVersion: appVersion)
     }
 
-    private func records(in bucket: String) throws -> [StoreRecord] {
+    func records(in bucket: String) throws -> [StoreRecord] {
         let predicate = Predicate<StoreRecord> { row in
             PredicateExpressions.build_Equal(
                 lhs: PredicateExpressions.build_KeyPath(root: row, keyPath: \StoreRecord.bucket),
@@ -359,7 +413,7 @@ final class TodoRepository: ProjectPersisting {
         return try context.fetch(FetchDescriptor(predicate: predicate))
     }
 
-    private func record(key: String) throws -> StoreRecord? {
+    func record(key: String) throws -> StoreRecord? {
         let predicate = Predicate<StoreRecord> { row in
             PredicateExpressions.build_Equal(
                 lhs: PredicateExpressions.build_KeyPath(root: row, keyPath: \StoreRecord.key),
@@ -371,7 +425,7 @@ final class TodoRepository: ProjectPersisting {
         return matches.first
     }
 
-    private func scheduleBackup() {
+    func scheduleBackup() {
         backupTask?.cancel()
         let factory = backupService
         let directory = paths.backups

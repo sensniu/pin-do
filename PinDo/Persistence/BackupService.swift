@@ -22,16 +22,18 @@ struct StoreArchive: Codable, Sendable {
 
     func validate() throws {
         if formatVersion == 1 { _ = try LegacyDataMigration.convert(self); return }
-        guard formatVersion == 2 else { throw StoreFailure.unsupportedVersion }
+        guard [2, 3].contains(formatVersion) else { throw StoreFailure.unsupportedVersion }
         guard Set(records.map(\.key)).count == records.count else { throw StoreFailure.invalidBackup }
         let decoder = JSONDecoder()
         var items: [UUID: TodoItem] = [:], projects: [UUID: Project] = [:]
         var events: [TodoEvent] = []
         var draft: NoteDraft?
         var metadata = 0
+        var syncRecords = 0
+        var syncProjection: (items: [TodoItem], projects: [Project], events: [TodoEvent])?
         for record in records {
             switch record.bucket {
-            case "todo-active", "todo-completed", "todo-abandoned":
+            case "todo-active", "todo-completed", "todo-abandoned", "todo-conflicted":
                 let item = try decoder.decode(TodoItem.self, from: record.payload)
                 try Self.validate(item)
                 guard record.key == "todo:\(item.id.uuidString)", record.bucket == "todo-\(item.status.rawValue)" else { throw StoreFailure.invalidBackup }
@@ -48,13 +50,19 @@ struct StoreArchive: Codable, Sendable {
             case "draft":
                 guard record.key == "editor-draft", draft == nil else { throw StoreFailure.invalidBackup }
                 draft = try decoder.decode(NoteDraft.self, from: record.payload)
+            case "sync-state":
+                guard formatVersion == 3, record.key == "sync-state" else { throw StoreFailure.invalidBackup }
+                let state = try JSONDecoder().decode(SyncState.self, from: record.payload)
+                guard state.version == 1 else { throw StoreFailure.unsupportedVersion }
+                syncProjection = try SyncGraph(state.changes).projection()
+                syncRecords += 1
             case "storage-meta":
-                guard record.key == "storage-meta", try decoder.decode(StoreMetadata.self, from: record.payload).formatVersion == 2 else { throw StoreFailure.unsupportedVersion }
+                guard record.key == "storage-meta", try decoder.decode(StoreMetadata.self, from: record.payload).formatVersion == formatVersion else { throw StoreFailure.unsupportedVersion }
                 metadata += 1
             default: throw StoreFailure.invalidBackup
             }
         }
-        guard metadata == 1 else { throw StoreFailure.invalidBackup }
+        guard metadata == 1, syncRecords == (formatVersion == 3 ? 1 : 0) else { throw StoreFailure.invalidBackup }
         for item in items.values {
             if let id = item.projectID {
                 guard let project = projects[id], item.status != .active || project.status == .active else { throw StoreFailure.invalidBackup }
@@ -67,8 +75,16 @@ struct StoreArchive: Codable, Sendable {
         }
         if let draft {
             guard (1...3).contains(draft.stars), draft.dueAt.timeIntervalSince1970.isFinite,
-                  draft.projectID.map({ projects[$0]?.status == .active }) ?? true,
-                  draft.isNew || items[draft.id]?.status == .active else { throw StoreFailure.invalidBackup }
+                  draft.projectID.map({ formatVersion == 3 ? projects[$0] != nil : projects[$0]?.status == .active }) ?? true,
+                  draft.isNew || items[draft.id] != nil else { throw StoreFailure.invalidBackup }
+        }
+        if let projection = syncProjection {
+            func encodedItems(_ values: [TodoItem]) throws -> Data { try SyncCodec.encode(values.sorted { $0.id.uuidString < $1.id.uuidString }) }
+            func encodedProjects(_ values: [Project]) throws -> Data { try SyncCodec.encode(values.sorted { $0.id.uuidString < $1.id.uuidString }) }
+            func encodedEvents(_ values: [TodoEvent]) throws -> Data { try SyncCodec.encode(values.sorted { $0.id.uuidString < $1.id.uuidString }) }
+            guard try encodedItems(Array(items.values)) == encodedItems(projection.items),
+                  try encodedProjects(Array(projects.values)) == encodedProjects(projection.projects),
+                  try encodedEvents(events) == encodedEvents(projection.events) else { throw StoreFailure.invalidBackup }
         }
         guard events.allSatisfy({ items[$0.itemID] != nil }) else { throw StoreFailure.invalidBackup }
         let completed = Dictionary(uniqueKeysWithValues: events.filter { $0.kind == .completed }.map { ($0.id, $0.itemID) })
@@ -98,6 +114,8 @@ struct StoreArchive: Codable, Sendable {
             guard item.completedAt == nil, item.abandonedAt == nil else { throw StoreFailure.invalidItem }
         case .completed:
             guard item.completedAt?.timeIntervalSince1970.isFinite == true, item.abandonedAt == nil else { throw StoreFailure.invalidItem }
+        case .conflicted:
+            guard item.completedAt == nil, item.abandonedAt == nil else { throw StoreFailure.invalidItem }
         case .abandoned:
             guard item.abandonedAt?.timeIntervalSince1970.isFinite == true, item.completedAt == nil else { throw StoreFailure.invalidItem }
         }
@@ -150,7 +168,9 @@ actor BackupService: ModelActor {
         let records = try snapshotContext.fetch(FetchDescriptor<StoreRecord>()).map {
             StoredValue(key: $0.key, bucket: $0.bucket, payload: $0.payload)
         }
-        let data = try BackupCodec.encode(StoreArchive(appVersion: appVersion, createdAt: .now, records: records))
+        var archive = StoreArchive(appVersion: appVersion, createdAt: .now, records: records)
+        archive.formatVersion = records.contains { $0.bucket == "sync-state" } ? 3 : 2
+        let data = try BackupCodec.encode(archive)
         try Task.checkCancellation()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let calendar = Calendar(identifier: .gregorian)

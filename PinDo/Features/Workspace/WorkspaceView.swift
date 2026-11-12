@@ -4,6 +4,7 @@ struct WorkspaceView: View {
     @ObservedObject var model: BoardModel
     @Binding var managingProjects: Bool
     @Binding var managingAppearance: Bool
+    @EnvironmentObject private var sync: SyncCoordinator
     @EnvironmentObject private var settings: AppearanceSettings
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -48,6 +49,8 @@ struct WorkspaceView: View {
             }
         }
         .frame(minWidth: 760, minHeight: 560)
+        .sheet(isPresented: $sync.showingSettings) { SyncSettingsView(sync: sync) }
+        .sheet(isPresented: $sync.showingConflicts) { SyncConflictsView(sync: sync) }
         .sheet(isPresented: $managingProjects) { ProjectManagementView(model: model) }
         .sheet(isPresented: $managingAppearance) { AppearanceSettingsView(settings: settings) }
         .alert("操作未保存", isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {

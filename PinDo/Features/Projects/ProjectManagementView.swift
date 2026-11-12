@@ -8,6 +8,7 @@ final class ProjectManagementModel: ObservableObject {
     @Published var newName = ""
     @Published var editingID: UUID?
     @Published var color = Color.blue
+    var syncBaseline: SyncProjectBaseline?
     @Published var deleting: Project?
     @Published var confirming = false
     @Published var archiving: Project?
@@ -80,6 +81,7 @@ struct ProjectManagementView: View {
                     Text(model.projectLabel(project)).lineLimit(1).help(project.name)
                     Spacer()
                     Button("编辑") {
+                        form.syncBaseline = model.projectSyncBaseline(project)
                         form.editingID = project.id; form.name = project.name
                         form.color = Color(red: project.red, green: project.green, blue: project.blue)
                     }.buttonStyle(.borderless)
@@ -113,7 +115,7 @@ struct ProjectManagementView: View {
     }
     private func saveEdit() {
         guard let id = form.editingID, let color = NSColor(form.color).usingColorSpace(.sRGB) else { return }
-        if model.updateProject(id, name: form.name, color: ProjectColor(red: color.redComponent, green: color.greenComponent, blue: color.blueComponent)) { form.editingID = nil }
+        if model.updateProject(id, name: form.name, color: ProjectColor(red: color.redComponent, green: color.greenComponent, blue: color.blueComponent), baseline: form.syncBaseline) { form.editingID = nil }
     }
     private func clearEditor(_ id: UUID) { if model.errorMessage == nil, form.editingID == id { form.editingID = nil } }
 }

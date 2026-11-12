@@ -13,6 +13,7 @@ final class AppEnvironment: ObservableObject {
     @Published var managingProjects = false
     @Published var managingAppearance = false
     let appearance = AppearanceSettings()
+    let sync = SyncCoordinator()
     // Transient development preview; Release always follows the system.
     @Published var previewScheme: ColorScheme?
     private(set) var repository: TodoRepository?
@@ -30,7 +31,7 @@ final class AppEnvironment: ObservableObject {
             return
         }
         opening = true; startupError = nil
-        Task {
+        Task { [self] in
             do {
                 let paths = try AppPaths.application(isDevelopment: AppConfiguration.isDevelopment)
                 self.paths = paths
@@ -43,10 +44,16 @@ final class AppEnvironment: ObservableObject {
                 let board = BoardModel(items: data.items, projects: data.projects, persistence: repository)
                 self.configureScope(board)
                 board.draft = try repository.loadDraft()
+                board.refreshFromSync()
                 repository.onBackupFailure = { [weak self] message in
                     self?.notice = "待办已保存，但自动备份未完成：\(message)"
                 }
                 self.repository = repository; self.board = board; startupError = nil
+                sync.didReceive = { [weak self] in
+                    guard let self, !self.managingProjects else { return }
+                    self.board?.refreshFromSync()
+                }
+                sync.attach(repository)
             } catch {
                 startupError = error.localizedDescription; board = nil
             }
@@ -97,8 +104,9 @@ final class AppEnvironment: ObservableObject {
         do {
             let archive = try BackupCodec.decode(Data(contentsOf: url))
             let confirm = NSAlert()
-            confirm.messageText = "恢复这份备份？"
-            confirm.informativeText = "当前待办和历史记录将替换为备份中的内容。恢复前会在数据目录保存一份安全备份。"
+            let merging = try repository.syncState() != nil
+            confirm.messageText = merging ? "合并这份备份？" : "恢复这份备份？"
+            confirm.informativeText = merging ? "已绑定同步：保留当前数据，合并备份中的事项与历史；不同内容保留为候选。不会用旧备份清空云端。合并前会保存安全备份。" : "当前待办和历史记录将替换为备份中的内容。恢复前会在数据目录保存一份安全备份。"
             confirm.addButton(withTitle: "恢复")
             confirm.addButton(withTitle: "取消")
             guard confirm.runModal() == .alertFirstButtonReturn else { return }
@@ -109,7 +117,9 @@ final class AppEnvironment: ObservableObject {
             let board = BoardModel(items: data.items, projects: data.projects, persistence: repository)
             configureScope(board)
             board.draft = try repository.loadDraft()
+            board.refreshFromSync()
             self.board = board
+            sync.attach(repository)
             notice = "备份已恢复。恢复前的数据位于 Backups/before-restore.pindobackup。"
         } catch { notice = "恢复未完成，原数据已保留：\(error.localizedDescription)" }
     }

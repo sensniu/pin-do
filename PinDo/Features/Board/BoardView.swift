@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct BoardView: View {
+    @EnvironmentObject private var sync: SyncCoordinator
     @ObservedObject var model: BoardModel
     @StateObject private var clock = BoardClock()
     @StateObject private var session = BoardSession()
@@ -97,6 +98,7 @@ struct BoardView: View {
             Text("\(model.visibleItems.count) 项" + (overdue > 0 ? " · \(overdue) 项已逾期" : ""))
                 .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize()
             Spacer(minLength: 8)
+            SyncRefreshButton(sync: sync)
             if let receipt = model.undo {
                 Text("已完成").font(.system(size: 12)).foregroundStyle(.secondary)
                 UndoCountdownView(receipt: receipt) {

@@ -1,7 +1,7 @@
 import Foundation
 
 enum TodoStatus: String, Codable, Equatable, Sendable {
-    case active, completed, abandoned
+    case active, completed, abandoned, conflicted
 }
 
 struct TodoItem: Identifiable, Codable, Equatable, Sendable {

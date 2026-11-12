@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct PinDoApp: App {
     @StateObject private var environment = AppEnvironment()
+    @Environment(\.scenePhase) private var scenePhase
     @NSApplicationDelegateAdaptor(ApplicationDelegate.self) private var delegate
 
     var body: some Scene {
@@ -33,8 +34,13 @@ struct PinDoApp: App {
                 }
             }
             .environmentObject(environment.appearance)
+            .environmentObject(environment.sync)
+            .onChange(of: scenePhase) { _, phase in if phase == .active { environment.sync.requestSync() } }
             .preferredColorScheme(environment.previewScheme)
             .onAppear { delegate.environment = environment }
+            .onChange(of: environment.managingProjects) { _, open in
+                if !open { environment.board?.refreshFromSync() }
+            }
             .alert("PinDo", isPresented: Binding(
                 get: { environment.notice != nil },
                 set: { if !$0 { environment.notice = nil } }
@@ -75,6 +81,9 @@ struct PinDoApp: App {
                     .disabled(environment.board == nil || environment.board?.draft != nil || environment.managingProjects || environment.managingAppearance)
             }
             CommandMenu("数据") {
+                SyncMenuItems(sync: environment.sync)
+                    .disabled(environment.repository == nil || environment.board?.draft != nil || environment.managingProjects || environment.managingAppearance)
+                Divider()
                 Button("导出备份…") { environment.exportBackup() }
                     .disabled(environment.repository == nil)
                 Button("从备份恢复…") { environment.importBackup() }
