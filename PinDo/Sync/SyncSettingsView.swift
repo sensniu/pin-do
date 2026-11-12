@@ -37,7 +37,7 @@ struct SyncSettingsView: View {
                 TextField("账号", text: $draft.username)
                 SecureField(sync.configuration == nil ? "应用授权密码" : "新密码（留空保留原密码）", text: $draft.password)
             }.textFieldStyle(.roundedBorder)
-            Text("使用专用目录；多台设备填写同一个目录。目录不存在时会尝试创建，父目录需已存在。连接会合并其中的 PinDo 数据，不会用本机数据覆盖整个目录。")
+            Text("使用专用目录；多台设备填写同一个目录。首次连接会按层级创建缺失文件夹，并初始化同步信息。连接已有同步库时会合并数据，不会用本机数据覆盖整个目录。")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Image(systemName: sync.enabled ? "arrow.triangle.2.circlepath" : "pause.circle")

@@ -1,5 +1,103 @@
 import XCTest
 
+/// Real URLSession/WebDAVClient requests, intercepted in process; never contacts a network host.
+final class BootstrapDAVProtocol: URLProtocol, @unchecked Sendable {
+    static let server = BootstrapDAVServer()
+    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "bootstrap.invalid" }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        do {
+            let result = try Self.server.respond(request)
+            let response = HTTPURLResponse(url: request.url!, statusCode: result.status, httpVersion: "HTTP/1.1", headerFields: result.headers)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: result.data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch { client?.urlProtocol(self, didFailWithError: error) }
+    }
+    override func stopLoading() {}
+}
+
+final class BootstrapDAVServer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var directories: Set<String> = ["/dav"]
+    private var files: [String: Data] = [:]
+    private var denied = false
+    private var puts = 0
+    private var ignoreCreateCondition = false, ignoreMatch = false, ignoreMoveGuard = false, missingTag = false
+    private var bareTag = false
+    private var failMovedDestination: String?
+    private var competingMove: (path: String, data: Data)?
+    func reset(denied: Bool = false, nutstore: Bool = false, unsafeMatch: Bool = false, unsafeMove: Bool = false, missingTag: Bool = false) {
+        lock.withLock {
+            directories = ["/dav"]; files = [:]; self.denied = denied; puts = 0
+            ignoreCreateCondition = nutstore; bareTag = nutstore; ignoreMatch = unsafeMatch
+            ignoreMoveGuard = unsafeMove; self.missingTag = missingTag; failMovedDestination = nil; competingMove = nil
+        }
+    }
+    func failMoveOnce(to path: String) { lock.withLock { failMovedDestination = path } }
+    func insertCompetitorOnMove(path: String, data: Data) { lock.withLock { competingMove = (path, data) } }
+    var filePaths: [String] { lock.withLock { files.keys.sorted() } }
+    func remove(_ path: String) { lock.withLock { files.removeValue(forKey: path) } }
+    func insertFile(_ path: String) { lock.withLock { files[path] = Data("occupied".utf8) } }
+    var putCount: Int { lock.withLock { puts } }
+    func respond(_ request: URLRequest) throws -> (status: Int, data: Data, headers: [String: String]) {
+        try lock.withLock {
+            let path = "/" + request.url!.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let method = request.httpMethod ?? "GET"
+            func tag(_ data: Data) -> String { bareTag ? SyncCodec.hash(data) : "\"" + SyncCodec.hash(data) + "\"" }
+            func result(_ status: Int, _ data: Data = Data()) -> (Int, Data, [String: String]) {
+                (status, data, missingTag ? [:] : ["ETag": tag(data)])
+            }
+            if denied { return result(401) }
+            if ["MKCOL", "PROPFIND"].contains(method), !request.url!.absoluteString.hasSuffix("/") { return result(301) }
+            if method == "MKCOL" {
+                if directories.contains(path) || files[path] != nil { return result(405) }
+                guard directories.contains((path as NSString).deletingLastPathComponent) else { return result(409) }
+                directories.insert(path); return result(201)
+            }
+            if method == "PROPFIND" {
+                guard directories.contains(path) || files[path] != nil else { return result(404) }
+                let descendants = request.value(forHTTPHeaderField: "Depth") == "0" ? [] : Array(directories.union(files.keys)).filter { ($0 as NSString).deletingLastPathComponent == path }
+                let entries = ([path] + descendants).sorted().map { entry in
+                    let collection = directories.contains(entry) ? "<d:collection/>" : ""
+                    return "<d:response><d:href>\(entry)</d:href><d:propstat><d:prop><d:resourcetype>\(collection)</d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+                }.joined()
+                return result(207, Data(("<d:multistatus xmlns:d=\"DAV:\">" + entries + "</d:multistatus>").utf8))
+            }
+            let old = files[path]
+            if method == "GET" { return result(old == nil ? 404 : 200, old ?? Data()) }
+            if !ignoreCreateCondition, request.value(forHTTPHeaderField: "If-None-Match") == "*", old != nil { return result(412) }
+            if !ignoreMatch, let expected = request.value(forHTTPHeaderField: "If-Match"), expected != old.map(tag) { return result(412) }
+            if method == "MOVE" {
+                guard let destination = request.value(forHTTPHeaderField: "Destination").flatMap(URL.init(string:)), destination.host == request.url!.host else { return result(400) }
+                let target = "/" + destination.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                guard let bytes = old else { return result(404) }
+                guard directories.contains((target as NSString).deletingLastPathComponent) else { return result(409) }
+                if let competingMove, competingMove.path == target { files[target] = competingMove.data; self.competingMove = nil }
+                if files[target] != nil && request.value(forHTTPHeaderField: "Overwrite") == "F" && !ignoreMoveGuard { return result(409) }
+                let existed = files[target] != nil
+                files[target] = bytes; files.removeValue(forKey: path)
+                if failMovedDestination == target { failMovedDestination = nil; throw URLError(.timedOut) }
+                return result(existed ? 204 : 201)
+            }
+            if method == "PUT" {
+                guard directories.contains((path as NSString).deletingLastPathComponent) else { return result(409) }
+                // URLSession may turn the upload body into a stream for a URLProtocol.
+                var body = request.httpBody
+                if body == nil, let stream = request.httpBodyStream {
+                    stream.open(); defer { stream.close() }
+                    var bytes = Data(), buffer = [UInt8](repeating: 0, count: 4096)
+                    while stream.hasBytesAvailable { let count = stream.read(&buffer, maxLength: buffer.count); if count <= 0 { break }; bytes.append(contentsOf: buffer.prefix(count)) }
+                    body = bytes
+                }
+                files[path] = body ?? Data(); puts += 1; return result(old == nil ? 201 : 204)
+            }
+            if method == "DELETE" { files.removeValue(forKey: path); return result(204) }
+            return result(405)
+        }
+    }
+}
+
 actor MemoryDAV: DAVTransport {
     var files: [String: Data] = [:]
     var directories: Set<String> = [""]
@@ -12,6 +110,10 @@ actor MemoryDAV: DAVTransport {
         let old = files[path]
         let tag = old.map { "\"" + SyncCodec.hash($0) + "\"" }
         if method == "GET" { return DAVResponse(data: old ?? Data(), status: old == nil ? 404 : 200, etag: tag) }
+        if method == "PROPFIND", directories.contains(path) {
+            let xml = "<d:multistatus xmlns:d=\"DAV:\"><d:response><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"
+            return DAVResponse(data: Data(xml.utf8), status: 207, etag: nil)
+        }
         if method == "MKCOL" { return DAVResponse(data: Data(), status: directories.insert(path).inserted ? 201 : 405, etag: nil) }
         if !ignoresConditions {
             if headers["If-None-Match"] == "*", old != nil { return DAVResponse(data: Data(), status: 412, etag: tag) }
@@ -34,6 +136,208 @@ actor MemoryDAV: DAVTransport {
 
 final class SyncTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
+    private func bootstrapClient(directory: String = "PinDo/nested", mode: DAVCreationMode? = nil) throws -> WebDAVClient {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [BootstrapDAVProtocol.self]
+        return try WebDAVClient(connection: SyncConnection(server: "https://bootstrap.invalid/dav/", directory: directory, username: "test-only"), password: "not-a-real-password", configuration: configuration, creationMode: mode)
+    }
+    func testNutstoreStyleConditionsUseExclusiveMoveAndPreserveRawTags() async throws {
+        BootstrapDAVProtocol.server.reset(nutstore: true)
+        let client = try bootstrapClient(); try await client.prepareRootHierarchy()
+        let mode = try await client.probe()
+        XCTAssertEqual(mode, .exclusiveMove)
+        XCTAssertTrue(BootstrapDAVProtocol.server.filePaths.isEmpty)
+        let first = try SyncCodec.encode("内容一"), second = try SyncCodec.encode("内容二")
+        try await client.create("protected.json", data: first)
+        do { try await client.create("protected.json", data: second); XCTFail("Existing bytes overwritten") }
+        catch { guard case SyncFailure.identityCollision = error else { return XCTFail("Unexpected: \(error)") } }
+        let saved = try await client.get("protected.json")
+        XCTAssertEqual(saved.data, first)
+        let tag = try XCTUnwrap(saved.etag)
+        XCTAssertFalse(tag.hasPrefix("\""))
+        let update = try await client.request("PUT", path: "protected.json", body: second, headers: ["If-Match": tag])
+        XCTAssertEqual(update.status, 204)
+        let stale = try await client.request("PUT", path: "protected.json", body: first, headers: ["If-Match": tag])
+        XCTAssertEqual(stale.status, 412)
+        XCTAssertEqual(BootstrapDAVProtocol.server.filePaths, ["/dav/PinDo/nested/protected.json"])
+    }
+    func testExclusiveMoveAllowsOnlyOneConcurrentCreator() async throws {
+        BootstrapDAVProtocol.server.reset(nutstore: true)
+        let a = try bootstrapClient(mode: .exclusiveMove), b = try bootstrapClient(mode: .exclusiveMove)
+        try await a.prepareRootHierarchy()
+        let first = try SyncCodec.encode("A"), second = try SyncCodec.encode("B")
+        let wins = await withTaskGroup(of: Bool.self) { group in
+            group.addTask { do { try await a.create("race.json", data: first); return true } catch { return false } }
+            group.addTask { do { try await b.create("race.json", data: second); return true } catch { return false } }
+            var count = 0
+            for await success in group where success { count += 1 }
+            return count
+        }
+        XCTAssertEqual(wins, 1)
+        let final = try await a.get("race.json")
+        XCTAssertTrue([first, second].contains(final.data))
+        XCTAssertEqual(BootstrapDAVProtocol.server.filePaths, ["/dav/PinDo/nested/race.json"])
+    }
+    func testExclusiveMoveRecoversCommittedButLostResponseAndCleansStaging() async throws {
+        BootstrapDAVProtocol.server.reset(nutstore: true)
+        let client = try bootstrapClient(); try await client.prepareRootHierarchy(); try await client.probe()
+        let bytes = try SyncCodec.encode("已提交但响应丢失")
+        BootstrapDAVProtocol.server.failMoveOnce(to: "/dav/PinDo/nested/retry.json")
+        try await client.create("retry.json", data: bytes)
+        let count = BootstrapDAVProtocol.server.putCount
+        try await client.create("retry.json", data: bytes)
+        XCTAssertEqual(BootstrapDAVProtocol.server.putCount, count)
+        XCTAssertEqual(BootstrapDAVProtocol.server.filePaths, ["/dav/PinDo/nested/retry.json"])
+    }
+    @MainActor
+    func testConcurrentLibraryCreationAdoptsWinnerWithoutOverwrite() async throws {
+        BootstrapDAVProtocol.server.reset(nutstore: true)
+        let client = try bootstrapClient(); try await client.prepareRootHierarchy(); try await client.probe()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-library-race-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.8.1")
+        let item = TodoItem(title: "创建竞争时保留本机事项", createdAt: now)
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        try store.initializeSync()
+        let winner = SyncLibrary(id: UUID()), bytes = try SyncCodec.wrap(winner)
+        BootstrapDAVProtocol.server.insertCompetitorOnMove(path: "/dav/PinDo/nested/library.json", data: bytes)
+        let sync = SyncCoordinator(); sync.attach(store)
+        _ = try await sync.exchange(using: client)
+        XCTAssertEqual(try store.syncState()?.libraryID, winner.id)
+        let final = try await client.get("library.json")
+        XCTAssertEqual(final.data, bytes)
+        XCTAssertEqual(try store.storedItem(item.id)?.title, item.title)
+        XCTAssertEqual(try store.syncState()?.pendingCount, 0)
+        XCTAssertFalse(BootstrapDAVProtocol.server.filePaths.contains { $0.contains("pindo-upload-") })
+    }
+    @MainActor
+    func testNutstoreStyleTwoClientsExchangeAndUpdateExistingHeads() async throws {
+        BootstrapDAVProtocol.server.reset(nutstore: true)
+        let client = try bootstrapClient(); try await client.prepareRootHierarchy()
+        let mode = try await client.probe()
+        let secondClient = try bootstrapClient(mode: mode)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-nutstore-mode-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let a = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("a")), appVersion: "0.8.1")
+        let b = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("b")), appVersion: "0.8.1")
+        let item = TodoItem(title: "初始", notes: "原备注", createdAt: now)
+        try a.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        try a.initializeSync(); try b.initializeSync()
+        var state = try XCTUnwrap(a.syncState()); state.remoteCreationMode = mode; try a.saveSyncState(state)
+        let ca = SyncCoordinator(), cb = SyncCoordinator(); ca.attach(a); cb.attach(b)
+        _ = try await ca.exchange(using: client); _ = try await cb.exchange(using: secondClient)
+        var ai = try XCTUnwrap(a.storedItem(item.id)), bi = try XCTUnwrap(b.storedItem(item.id))
+        ai.title = "Mac 改标题"; bi.notes = "另一端改备注"
+        try a.commit(ai, event: TodoEvent(itemID: item.id, kind: .edited, occurredAt: now), clearDraft: true)
+        try b.commit(bi, event: TodoEvent(itemID: item.id, kind: .edited, occurredAt: now), clearDraft: true)
+        _ = try await cb.exchange(using: secondClient); _ = try await ca.exchange(using: client); _ = try await cb.exchange(using: secondClient)
+        XCTAssertEqual(try a.loadActiveItems(), try b.loadActiveItems())
+        XCTAssertEqual(try a.storedItem(item.id)?.title, ai.title)
+        XCTAssertEqual(try a.storedItem(item.id)?.notes, bi.notes)
+        XCTAssertEqual(try a.syncState()?.remoteCreationMode, .exclusiveMove)
+        XCTAssertGreaterThan(try a.syncState()!.outgoing.sequence, 1)
+        XCTAssertFalse(BootstrapDAVProtocol.server.filePaths.contains { $0.contains("pindo-upload-") || $0.contains("probe-") })
+        _ = try BackupCodec.decode(BackupCodec.encode(a.archive()))
+    }
+    func testBrokenVersionChecksAndBrokenMoveAreStillRejectedWithDetails() async throws {
+        for variant in 0..<3 {
+            BootstrapDAVProtocol.server.reset(nutstore: true, unsafeMatch: variant == 0, unsafeMove: variant == 1, missingTag: variant == 2)
+            let client = try bootstrapClient(); try await client.prepareRootHierarchy()
+            do { try await client.probe(); XCTFail("Unsafe provider accepted") }
+            catch {
+                guard case SyncFailure.serverCapability(let stage, _, _) = error else { return XCTFail("No diagnostic: \(error)") }
+                XCTAssertTrue(stage.contains(["旧版本", "禁止覆盖", "ETag"][variant]))
+            }
+            XCTAssertTrue(BootstrapDAVProtocol.server.filePaths.isEmpty)
+        }
+    }
+    func testOldSyncStateLoadsWithoutCreationCapabilityAndNewStatePersistsIt() throws {
+        var state = SyncState(); state.remoteCreationMode = .exclusiveMove
+        let data = try JSONEncoder().encode(state)
+        XCTAssertEqual(try JSONDecoder().decode(SyncState.self, from: data).remoteCreationMode, .exclusiveMove)
+        var old = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        old.removeValue(forKey: "remoteCreationMode")
+        XCTAssertNil(try JSONDecoder().decode(SyncState.self, from: JSONSerialization.data(withJSONObject: old)).remoteCreationMode)
+    }
+    @MainActor
+    func testInterruptedInitialLibraryPublishReusesPersistedProposal() async throws {
+        BootstrapDAVProtocol.server.reset(nutstore: true)
+        let client = try bootstrapClient(); try await client.prepareRootHierarchy(); try await client.probe()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-initial-proposal-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.8.1")
+        try store.initializeSync()
+        let proposed = UUID()
+        var state = try XCTUnwrap(store.syncState()); state.proposedLibraryID = proposed
+        try store.saveSyncState(state)
+        let sync = SyncCoordinator(); sync.attach(store)
+        _ = try await sync.exchange(using: client)
+        XCTAssertEqual(try store.syncState()?.libraryID, proposed)
+        XCTAssertNil(try store.syncState()?.proposedLibraryID)
+        let published = try await client.get("library.json")
+        XCTAssertEqual(try SyncCodec.unwrap(SyncLibrary.self, published.data).id, proposed)
+    }
+    @MainActor
+    func testFirstSyncCreatesNestedCollectionsAndAcceptsInitiallyMissingFiles() async throws {
+        BootstrapDAVProtocol.server.reset()
+        let client = try bootstrapClient()
+        try await client.prepareRootHierarchy(); try await client.prepareRootHierarchy() // Existing folders are verified, not errors.
+        try await client.probe()
+        let missing = try await client.get("library.json")
+        XCTAssertEqual(missing.status, 404)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-first-network-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.8.0")
+        try store.initializeSync()
+        let sync = SyncCoordinator(); sync.attach(store)
+        _ = try await sync.exchange(using: client) // No todo, no head.json yet: valid initialized empty library.
+        XCTAssertNotNil(try store.syncState()?.libraryID)
+        XCTAssertNotNil(try store.syncState()?.lastSuccess)
+        let item = TodoItem(title: "第一次新增后发送", createdAt: now)
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        _ = try await sync.exchange(using: client)
+        XCTAssertEqual(try store.syncState()?.pendingCount, 0)
+        XCTAssertEqual(try store.syncState()?.outgoing.sequence, 1)
+        let second = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("second")), appVersion: "0.8.0")
+        try second.initializeSync()
+        let joining = SyncCoordinator(); joining.attach(second)
+        _ = try await joining.exchange(using: client)
+        XCTAssertEqual(try second.loadActiveItems().first?.title, item.title)
+    }
+    @MainActor
+    func testAlreadyBoundLibraryMissingDoesNotCreateReplacement() async throws {
+        BootstrapDAVProtocol.server.reset()
+        let client = try bootstrapClient(); try await client.prepareRootHierarchy()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-missing-library-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.8.0")
+        let item = TodoItem(title: "不能被空库覆盖", createdAt: now)
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        try store.initializeSync()
+        let sync = SyncCoordinator(); sync.attach(store)
+        _ = try await sync.exchange(using: client)
+        let library = try store.syncState()?.libraryID, count = BootstrapDAVProtocol.server.putCount
+        BootstrapDAVProtocol.server.remove("/dav/PinDo/nested/library.json")
+        do { _ = try await sync.exchange(using: client); XCTFail("Lost library silently recreated") }
+        catch { guard case SyncFailure.wrongLibrary = error else { return XCTFail("Unexpected: \(error)") } }
+        XCTAssertEqual(BootstrapDAVProtocol.server.putCount, count)
+        XCTAssertEqual(try store.syncState()?.libraryID, library)
+        XCTAssertEqual(try store.storedItem(item.id)?.title, item.title)
+    }
+    func testFirstSyncAuthenticationErrorIsNotTreatedAsEmptyDirectory() async throws {
+        BootstrapDAVProtocol.server.reset(denied: true)
+        let client = try bootstrapClient()
+        do { try await client.prepareRootHierarchy(); XCTFail("Authentication failure ignored") }
+        catch { guard case SyncFailure.http(401) = error else { return XCTFail("Unexpected: \(error)") } }
+        XCTAssertEqual(BootstrapDAVProtocol.server.putCount, 0)
+    }
+    func testFirstSyncRejectsFileOccupyingConfiguredFolder() async throws {
+        BootstrapDAVProtocol.server.reset()
+        BootstrapDAVProtocol.server.insertFile("/dav/PinDo")
+        let client = try bootstrapClient()
+        do { try await client.prepareRootHierarchy(); XCTFail("File accepted as directory") } catch {}
+        XCTAssertEqual(BootstrapDAVProtocol.server.putCount, 0)
+    }
     private func seed(_ items: [TodoItem], projects: [Project] = []) throws -> SyncState {
         var state = SyncState()
         if let change = try SyncBuilder.capture(before: SyncContents(items: [], projects: [], events: []), after: SyncContents(items: items, projects: projects, events: []), state: state) { state.changes = [change] }
@@ -171,6 +475,47 @@ final class SyncTests: XCTestCase {
         try a.restore(a.archive())
         XCTAssertEqual(try a.loadActiveItems().first?.title, "Mac 修改")
     }
+    @MainActor
+    func testSyncRefreshKeepsManualLayoutsAndOnlyPlacesNewCardsWithoutUploadEcho() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-sync-layout-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let a = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("a")), appVersion: "0.6.0")
+        let b = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("b")), appVersion: "0.6.0")
+        let project = try a.createProject(name: "项目")
+        let item = TodoItem(title: "已有事项", projectID: project.id, createdAt: now)
+        try a.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        try a.initializeSync(); try b.initializeSync()
+        let ca = SyncCoordinator(), cb = SyncCoordinator(), dav = MemoryDAV()
+        ca.attach(a); cb.attach(b)
+        _ = try await ca.exchange(using: dav); _ = try await cb.exchange(using: dav)
+        let data = try a.loadBoardData()
+        let board = BoardModel(items: data.items, projects: data.projects, persistence: a)
+        ca.didReceive = { board.refreshFromSync() }
+        board.moveNote(item.id, to: CGPoint(x: -320, y: 180))
+        board.selectScope(.project(project.id)); board.moveNote(item.id, to: CGPoint(x: 240, y: -100))
+        board.selectScope(.all)
+        let original = board.layout.positions[item.id], camera = board.viewportBounds
+        let count = try a.syncState()!.changes.count
+        board.bringToFront(item.id); board.moveNote(item.id, to: original!)
+        XCTAssertEqual(try a.syncState()!.changes.count, count)
+        XCTAssertEqual(try a.syncState()!.pendingCount, 0)
+        var remote = try XCTUnwrap(b.storedItem(item.id)); remote.notes = "远端修改\n完整保留\n第三行"
+        try b.commit(remote, event: TodoEvent(itemID: item.id, kind: .edited, occurredAt: now), clearDraft: true)
+        let newItem = TodoItem(title: "远端新增", dueAt: now.addingTimeInterval(60), projectID: project.id, createdAt: now)
+        try b.commit(newItem, event: TodoEvent(itemID: newItem.id, kind: .created, occurredAt: now), clearDraft: true)
+        _ = try await cb.exchange(using: dav); _ = try await ca.exchange(using: dav)
+        XCTAssertEqual(board.layout.positions[item.id], original)
+        XCTAssertEqual(board.viewportBounds, camera)
+        XCTAssertEqual(board.items.first { $0.id == item.id }?.notes, remote.notes)
+        XCTAssertFalse(BoardLayoutEngine.conflicts(board.layout.frame(for: item.id)!, board.layout.frame(for: newItem.id)!))
+        XCTAssertEqual(try a.syncState()!.pendingCount, 0)
+        board.selectScope(.project(project.id))
+        XCTAssertEqual(board.layout.positions[item.id], CGPoint(x: 240, y: -100))
+        XCTAssertNotNil(board.layout.positions[newItem.id])
+        XCTAssertEqual(try a.loadActiveItems(), try b.loadActiveItems())
+        _ = try BackupCodec.decode(BackupCodec.encode(a.archive()))
+    }
+
     @MainActor
     func testLostUploadResponseRetriesSamePacketWithoutDuplicatingEvents() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-sync-retry-\(UUID())")

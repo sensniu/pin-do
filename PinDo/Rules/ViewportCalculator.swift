@@ -18,5 +18,10 @@ struct ViewportCalculator {
             y: viewport.height / 2 + (world.y - bounds.midY) * scale + pan.height
         )
     }
+
+    static func draggedPosition(origin: CGPoint, translation: CGSize, scale: CGFloat) -> CGPoint {
+        CGPoint(x: origin.x + translation.width / max(0.05, scale),
+                y: origin.y + translation.height / max(0.05, scale))
+    }
 }
 

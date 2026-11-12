@@ -205,7 +205,7 @@ final class ProjectTests: XCTestCase {
         XCTAssertEqual(model.visibleItems.count, 1)
         let item = model.visibleItems[0], positions = model.layout
         model.edit(item); draft = model.draft!; draft.projectID = q.id; model.submit(draft)
-        XCTAssertTrue(model.visibleItems.isEmpty); XCTAssertEqual(model.layout, positions)
+        XCTAssertTrue(model.visibleItems.isEmpty); XCTAssertEqual(model.layout.positions, positions.positions)
         model.selectScope(.project(q.id)); XCTAssertEqual(model.visibleItems.map(\.id), [item.id])
         model.selectScope(.unassigned); XCTAssertEqual(model.visibleItems.count, 1)
     }

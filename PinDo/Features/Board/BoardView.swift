@@ -19,6 +19,15 @@ struct BoardView: View {
                     let scale = currentScale(size: geometry.size)
                     ZStack {
                         boardColor
+                            .contentShape(Rectangle())
+                            .gesture(DragGesture(minimumDistance: 8)
+                                .onChanged { value in
+                                    if session.dragOrigin == nil { session.dragOrigin = session.pan }
+                                    session.pan = CGSize(
+                                        width: (session.dragOrigin?.width ?? 0) + value.translation.width,
+                                        height: (session.dragOrigin?.height ?? 0) + value.translation.height)
+                                }
+                                .onEnded { _ in session.dragOrigin = nil })
                         if model.visibleItems.isEmpty {
                             emptyState
                         }
@@ -33,8 +42,25 @@ struct BoardView: View {
                                     edit: { withAnimation(animation) { model.edit(item) } },
                                     complete: { withAnimation(animation) { model.complete(item.id) } }
                                 )
+                                .contentShape(RoundedRectangle(cornerRadius: 7))
+                                .highPriorityGesture(DragGesture(minimumDistance: 6, coordinateSpace: .named("board-canvas"))
+                                    .onChanged { value in
+                                        if session.noteDragID == nil {
+                                            session.noteDragID = item.id
+                                            session.noteDragOrigin = world
+                                            session.noteDragScale = scale
+                                            session.manualScale = scale
+                                            model.bringToFront(item.id)
+                                        }
+                                        guard session.noteDragID == item.id, let origin = session.noteDragOrigin else { return }
+                                        model.moveNote(item.id, to: ViewportCalculator.draggedPosition(
+                                            origin: origin, translation: value.translation, scale: session.noteDragScale))
+                                    }
+                                    .onEnded { _ in session.endNoteDrag() })
                                 .scaleEffect(scale)
                                 .position(point)
+                                .zIndex(model.zIndex(for: item.id))
+                                .accessibilityIdentifier("note-\(item.id)")
                                 .transition(.asymmetric(
                                     insertion: .opacity.combined(with: .scale(scale: 0.94)),
                                     removal: .opacity.combined(with: .offset(x: 12, y: -45)).combined(with: .scale(scale: 0.88))
@@ -43,29 +69,21 @@ struct BoardView: View {
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .coordinateSpace(name: "board-canvas")
                     .contentShape(Rectangle())
                     .background {
                         if model.draft == nil {
                             BoardGestureBridge { delta in
+                                guard session.noteDragID == nil else { return }
                                 session.pan.width += delta.width
                                 session.pan.height += delta.height
                             }
                         }
                     }
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 8)
-                            .onChanged { value in
-                                if session.dragOrigin == nil { session.dragOrigin = session.pan }
-                                session.pan = CGSize(
-                                    width: (session.dragOrigin?.width ?? 0) + value.translation.width,
-                                    height: (session.dragOrigin?.height ?? 0) + value.translation.height
-                                )
-                            }
-                            .onEnded { _ in session.dragOrigin = nil }
-                    )
                     .gesture(
                         MagnifyGesture()
                             .onChanged { value in
+                                guard session.noteDragID == nil else { return }
                                 if session.pinchOrigin == nil { session.pinchOrigin = scale }
                                 session.manualScale = clamped((session.pinchOrigin ?? scale) * value.magnification)
                             }
@@ -98,6 +116,11 @@ struct BoardView: View {
             Text("\(model.visibleItems.count) 项" + (overdue > 0 ? " · \(overdue) 项已逾期" : ""))
                 .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize()
             Spacer(minLength: 8)
+            Button { withAnimation(animation) { model.reorderBoard() } } label: {
+                Image(systemName: "square.grid.3x3").font(.system(size: 15))
+                    .frame(width: 30, height: 30).contentShape(Rectangle())
+            }.buttonStyle(.plain).help("重新整理当前白板（覆盖手动位置）")
+                .accessibilityLabel("重新整理白板").accessibilityIdentifier("reorder-board")
             SyncRefreshButton(sync: sync)
             if let receipt = model.undo {
                 Text("已完成").font(.system(size: 12)).foregroundStyle(.secondary)

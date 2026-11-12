@@ -87,13 +87,15 @@ final class BoardFlowTests: XCTestCase {
         let second = TodoItem(title: "two")
         let model = BoardModel(items: [first, second], date: { now }, uptime: { 10 })
         let original = model.layout.positions[first.id]!
+        let beforeSecond = model.layout.positions[second.id]
         model.complete(first.id)
         var draft = NoteDraft(now: now)
         draft.title = "new"
         model.submit(draft)
-        XCTAssertEqual(model.layoutRevision, 1)
+        XCTAssertEqual(model.layoutRevision, 0)
+        XCTAssertEqual(model.layout.positions[second.id], beforeSecond)
         let reserved = model.undo!.originalFrame
-        for id in model.layout.positions.keys {
+        for id in model.visibleItems.map(\.id) {
             XCTAssertFalse(model.layout.frame(for: id)!.intersects(reserved))
         }
         model.undoCompletion()
@@ -143,8 +145,10 @@ final class BoardFlowTests: XCTestCase {
         XCTAssertEqual(model.layout, before)
         XCTAssertEqual(model.layoutRevision, revision)
         model.selectScope(.all)
+        XCTAssertEqual(model.layout, before)
+        model.reorderBoard()
         XCTAssertNotEqual(model.layout, before)
-        XCTAssertEqual(model.layoutRevision, revision + 1)
+        XCTAssertEqual(model.layoutRevision, revision + 2)
     }
 
     @MainActor
@@ -207,25 +211,98 @@ final class BoardFlowTests: XCTestCase {
     }
 
     @MainActor
-    func testTextResizePreservesViewportRevisionAndUndoReservation() {
+    func testFreePlacementStacksWithoutMovingNeighborsOrCamera() {
+        let items = [TodoItem(title: "A"), TodoItem(title: "B"), TodoItem(title: "C")]
+        let model = BoardModel(items: items)
+        let before = model.layout.positions, camera = model.viewportBounds
+        let destination = before[items[1].id]!
+        model.bringToFront(items[0].id)
+        model.moveNote(items[0].id, to: destination)
+        XCTAssertEqual(model.layout.positions[items[0].id], destination)
+        XCTAssertEqual(model.layout.positions[items[1].id], before[items[1].id])
+        XCTAssertEqual(model.layout.positions[items[2].id], before[items[2].id])
+        XCTAssertGreaterThan(model.zIndex(for: items[0].id), model.zIndex(for: items[1].id))
+        XCTAssertEqual(model.viewportBounds, camera)
+        model.moveNote(items[0].id, to: CGPoint(x: -2000, y: 3000))
+        XCTAssertEqual(model.viewportBounds, camera)
+        model.fitBoard()
+        XCTAssertTrue(model.viewportBounds.contains(model.layout.frame(for: items[0].id)!))
+        let layout = model.layout
+        model.moveNote(items[0].id, to: CGPoint(x: CGFloat.nan, y: 0))
+        model.moveNote(UUID(), to: .zero)
+        XCTAssertEqual(model.layout, layout)
+    }
+
+    @MainActor
+    func testBoardsKeepIndependentPositionsAndStackOrderUntilExplicitReorderOrRestart() {
+        let p = Project(name: "P")
+        let a = TodoItem(title: "A", projectID: p.id), b = TodoItem(title: "B", projectID: p.id)
+        let model = BoardModel(items: [a, b], projects: [p])
+        model.moveNote(a.id, to: CGPoint(x: 400, y: -300)); model.bringToFront(a.id)
+        let allLayout = model.layout
+        model.selectScope(.project(p.id))
+        model.moveNote(a.id, to: CGPoint(x: -600, y: 100)); model.bringToFront(b.id)
+        let projectLayout = model.layout
+        model.selectScope(.unassigned); model.selectScope(.all)
+        XCTAssertEqual(model.layout, allLayout)
+        model.selectScope(.project(p.id)); XCTAssertEqual(model.layout, projectLayout)
+        model.reorderBoard()
+        XCTAssertEqual(model.layout, BoardLayoutEngine().layout(items: [a, b], now: .now))
+        model.selectScope(.all); XCTAssertEqual(model.layout, allLayout)
+        let restarted = BoardModel(items: [a, b], projects: [p])
+        XCTAssertNotEqual(restarted.layout.positions[a.id], allLayout.positions[a.id])
+        XCTAssertEqual(restarted.layout.positions, BoardLayoutEngine().layout(items: [a, b], now: .now).positions)
+    }
+
+    @MainActor
+    func testAddingAndEditingLeaveStackedNotesInPlace() {
+        let now = Date.now
+        let a = TodoItem(title: "A"), b = TodoItem(title: "B")
+        let model = BoardModel(items: [a, b])
+        model.moveNote(a.id, to: .zero); model.moveNote(b.id, to: .zero)
+        let positions = model.layout.positions, camera = model.viewportBounds
+        var draft = NoteDraft(now: now); draft.title = "紧急新事项"; draft.hasDeadline = true; draft.dueAt = now.addingTimeInterval(60)
+        model.submit(draft)
+        XCTAssertEqual(model.layout.positions[a.id], positions[a.id]); XCTAssertEqual(model.layout.positions[b.id], positions[b.id])
+        let newFrame = model.layout.frame(for: draft.id)!
+        XCTAssertFalse(BoardLayoutEngine.conflicts(newFrame, model.layout.frame(for: a.id)!))
+        var edit = NoteDraft(item: a, now: now); edit.notes = "第一行\n第二行\n第三行"
+        model.submit(edit)
+        XCTAssertEqual(model.layout.positions[a.id], positions[a.id]); XCTAssertEqual(model.layout.positions[b.id], positions[b.id])
+        XCTAssertEqual(model.viewportBounds, camera)
+        XCTAssertTrue(model.layout.frame(for: a.id)!.intersects(model.layout.frame(for: b.id)!))
+    }
+
+    @MainActor
+    func testUndoRestoresOriginalPositionEvenWhenOccupiedAfterReorder() {
+        let a = TodoItem(title: "A"), b = TodoItem(title: "B")
+        let model = BoardModel(items: [a, b], uptime: { 10 })
+        let original = model.layout.positions[a.id]!
+        model.complete(a.id)
+        model.reorderBoard()
+        model.moveNote(b.id, to: original)
+        model.undoCompletion()
+        XCTAssertEqual(model.layout.positions[a.id], original)
+        XCTAssertEqual(model.layout.positions[b.id], original)
+    }
+
+    @MainActor
+    func testTextResizePreservesNeighborsViewportAndUndoPosition() {
         let items = (0..<12).map { TodoItem(title: "item \($0)") }
         let model = BoardModel(items: items, uptime: { 10 })
         let completed = items[3]
         let point = model.layout.positions[completed.id]
         model.complete(completed.id)
-        let viewport = model.viewportBounds, revision = model.layoutRevision
+        let viewport = model.viewportBounds, revision = model.layoutRevision, positions = model.layout.positions
         var draft = NoteDraft(item: items[0], now: .now)
         draft.title = "这里是用于测试自动换行的很长的事项标题"
         draft.notes = "备注第一行\n第二行\n第三行"
         model.submit(draft)
         XCTAssertEqual(model.viewportBounds, viewport)
         XCTAssertEqual(model.layoutRevision, revision)
-        let reservation = model.undo!.originalFrame
-        for item in model.visibleItems { XCTAssertFalse(model.layout.frame(for: item.id)!.intersects(reservation)) }
+        XCTAssertEqual(model.layout.positions, positions)
         model.undoCompletion()
         XCTAssertEqual(model.layout.positions[completed.id], point)
-        let frames = model.visibleItems.compactMap { model.layout.frame(for: $0.id) }
-        for i in frames.indices { for j in frames.indices where j > i { XCTAssertFalse(frames[i].intersects(frames[j])) } }
     }
 
 }

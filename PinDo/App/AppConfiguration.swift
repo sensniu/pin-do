@@ -1,8 +1,16 @@
 import Foundation
 
 enum AppConfiguration {
-    static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.6.0"
-    static let isPrototype = ProcessInfo.processInfo.arguments.contains("--demo")
+    static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.8.1"
+    static var isPrototype: Bool {
+        if ProcessInfo.processInfo.arguments.contains("--demo") { return true }
+        #if DEBUG
+        // A disposable Debug preview bundle can be launched by UI tools without touching a real store.
+        return Bundle.main.object(forInfoDictionaryKey: "PinDoPreviewMode") as? Bool == true
+        #else
+        return false
+        #endif
+    }
     static var isDevelopment: Bool {
         #if DEBUG
         true

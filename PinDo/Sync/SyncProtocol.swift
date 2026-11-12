@@ -42,6 +42,7 @@ enum SyncCodec {
 enum SyncFailure: LocalizedError {
     case invalidData, missingDependency, identityCollision, unsupported, incompleteListing, unsafeServer, wrongLibrary
     case http(Int), throttled(TimeInterval), configuration(String)
+    case serverCapability(stage: String, detail: String, status: Int?)
     var errorDescription: String? {
         switch self {
         case .invalidData: "同步数据校验失败，本地内容已保留。"
@@ -50,6 +51,8 @@ enum SyncFailure: LocalizedError {
         case .unsupported: "此同步数据需要更新版本，已暂停同步。"
         case .incompleteListing: "服务器目录结果可能不完整，已停止同步，避免遗漏数据。"
         case .unsafeServer: "服务器未通过条件写入校验，无法安全开启同步。"
+        case .serverCapability(let stage, let detail, let status):
+            "WebDAV 兼容性检查未通过（\(stage)\(status.map { "，HTTP \($0)" } ?? "")）：\(detail) 本地内容已保留。"
         case .wrongLibrary: "目录对应的同步库已变化，请检查配置。本地数据已保留。"
         case .throttled: "服务器要求稍后重试，待发送内容已保留。"
         case .http(let status): "WebDAV 请求失败（HTTP \(status)），本地内容和待同步变更已保留。"
@@ -124,7 +127,9 @@ struct SyncState: Codable, Sendable {
     var version = 1
     var writerID = UUID()
     var libraryID: UUID?
+    var proposedLibraryID: UUID?
     var connection: SyncConnection?
+    var remoteCreationMode: DAVCreationMode?
     var enabled = false
     var changes: [SyncChange] = []
     var published: Set<UUID> = []

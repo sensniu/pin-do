@@ -144,7 +144,7 @@ final class RulesTests: XCTestCase {
         for i in 1..<distances.count { XCTAssertGreaterThanOrEqual(distances[i] + 0.02, distances[i - 1]) }
     }
 
-    func testGrowthOnlyMovesCollidingNeighborsAndShrinkDoesNotPullThemBack() {
+    func testGrowthAndShrinkPreserveEveryCardPosition() {
         var first = TodoItem(title: "first")
         let second = TodoItem(title: "second"), third = TodoItem(title: "third"), beside = TodoItem(title: "beside")
         let items = [first, second, third, beside]
@@ -153,16 +153,45 @@ final class RulesTests: XCTestCase {
             before.positions[item.id] = point; before.heights[item.id] = NoteMetrics.height(for: item)
         }
         first.notes = "第一行\n第二行\n第三行"
-        let ids = Set(items.map(\.id))
-        let after = BoardLayoutEngine().resized(before, item: first, visibleIDs: ids, reserved: [])
-        XCTAssertEqual(after.frame(for: first.id)!.minY, before.frame(for: first.id)!.minY)
-        XCTAssertGreaterThan(after.positions[second.id]!.y, before.positions[second.id]!.y)
-        XCTAssertGreaterThan(after.positions[third.id]!.y, before.positions[third.id]!.y)
+        let after = BoardLayoutEngine().refreshed(before, items: [first, second, third, beside], now: now)
+        XCTAssertEqual(after.positions, before.positions)
+        XCTAssertGreaterThan(after.heights[first.id]!, before.heights[first.id]!)
         XCTAssertEqual(after.positions[beside.id], before.positions[beside.id])
         first.notes = ""
-        let shrunk = BoardLayoutEngine().resized(after, item: first, visibleIDs: ids, reserved: [])
+        let shrunk = BoardLayoutEngine().refreshed(after, items: [first, second, third, beside], now: now)
         XCTAssertEqual(shrunk.positions[second.id], after.positions[second.id])
         XCTAssertEqual(shrunk.positions[third.id], after.positions[third.id])
+    }
+
+    func testDragTranslationUsesBoardCoordinatesAtEveryZoom() {
+        let origin = CGPoint(x: -100, y: 70), delta = CGSize(width: 60, height: -30)
+        for scale in [CGFloat(0.05), 0.3, 1, 2] {
+            let point = ViewportCalculator.draggedPosition(origin: origin, translation: delta, scale: scale)
+            let start = ViewportCalculator.position(world: origin, bounds: CGRect(x: -300, y: -200, width: 800, height: 500), viewport: CGSize(width: 900, height: 700), scale: scale, pan: CGSize(width: 20, height: -40))
+            let end = ViewportCalculator.position(world: point, bounds: CGRect(x: -300, y: -200, width: 800, height: 500), viewport: CGSize(width: 900, height: 700), scale: scale, pan: CGSize(width: 20, height: -40))
+            XCTAssertEqual(end.x - start.x, delta.width, accuracy: 0.001)
+            XCTAssertEqual(end.y - start.y, delta.height, accuracy: 0.001)
+        }
+    }
+
+    func testIncrementalPlacementLeavesExistingStackAndFindsSpaceForRemoteBatch() {
+        let existing = (0..<12).map { TodoItem(title: "原有 \($0)") }
+        let new = (0..<20).map { TodoItem(title: "新增 \($0)", dueAt: now.addingTimeInterval(Double($0 + 1) * 3600)) }
+        var old = BoardLayoutEngine().layout(items: existing, now: now)
+        for item in existing { old.positions[item.id] = .zero }
+        let updated = BoardLayoutEngine().refreshed(old, items: existing + new, now: now)
+        for item in existing { XCTAssertEqual(updated.positions[item.id], .zero) }
+        for (index, item) in new.enumerated() {
+            let frame = updated.frame(for: item.id)!
+            XCTAssertFalse(BoardLayoutEngine.conflicts(frame, updated.frame(for: existing[0].id)!))
+            for other in new.dropFirst(index + 1) { XCTAssertFalse(BoardLayoutEngine.conflicts(frame, updated.frame(for: other.id)!)) }
+        }
+        // With distant manually placed cards, an urgent insertion can use the free center.
+        for item in existing { old.positions[item.id] = CGPoint(x: 4000, y: 4000) }
+        let urgent = TodoItem(title: "立即处理", dueAt: now.addingTimeInterval(60))
+        let result = BoardLayoutEngine().refreshed(old, items: existing + [urgent], now: now)
+        let point = result.positions[urgent.id]!
+        XCTAssertLessThan(hypot(point.x, point.y), 300)
     }
 
 }

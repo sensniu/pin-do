@@ -3,6 +3,7 @@ import Foundation
 struct BoardLayout: Equatable {
     var positions: [UUID: CGPoint] = [:]
     var heights: [UUID: CGFloat] = [:]
+    var stackingOrder: [UUID] = []
     var bounds: CGRect = .zero
 
     func frame(for id: UUID) -> CGRect? {
@@ -35,7 +36,7 @@ struct BoardLayoutEngine {
             columnCounts = [2]
         }
         for columns in columnCounts {
-            var output = BoardLayout(heights: heights)
+            var output = BoardLayout(heights: heights, stackingOrder: ordered.map(\.id))
             var occupied = reserved
             var lastDistance: CGFloat = 0
             for item in ordered {
@@ -67,34 +68,43 @@ struct BoardLayoutEngine {
         return best
     }
 
-    /// Grow downward from the original top edge. Only actual collisions propagate;
-    /// shrinking leaves neighboring notes and the camera in place.
-    func resized(_ old: BoardLayout, item: TodoItem, visibleIDs: Set<UUID>, reserved: [CGRect]) -> BoardLayout {
-        guard let original = old.frame(for: item.id) else { return old }
-        let height = NoteMetrics.height(for: item)
-        guard height != original.height else { return old }
+    /// Reconcile content without moving any existing card. Only missing cards get a position.
+    func refreshed(_ old: BoardLayout, items: [TodoItem], now: Date, reserved: [CGRect] = [], viewport: CGSize = defaultViewport) -> BoardLayout {
+        let ordered = TodoOrdering().sorted(items.filter { $0.status == .active }, now: now)
+        let ids = Set(ordered.map(\.id))
         var result = old
-        result.heights[item.id] = height
-        result.positions[item.id] = CGPoint(x: original.midX, y: original.minY + height / 2)
-        var queue = [item.id]
-        let ids = visibleIDs.sorted { $0.uuidString < $1.uuidString }
-        while !queue.isEmpty {
-            let id = queue.removeFirst()
-            guard var frame = result.frame(for: id) else { continue }
-            while let obstacle = reserved.filter({ Self.conflicts(frame, $0) }).max(by: { $0.maxY < $1.maxY }) {
-                frame.origin.y = obstacle.maxY + Self.gap
-                result.positions[id] = CGPoint(x: frame.midX, y: frame.midY)
-            }
-            for neighbor in ids where neighbor != id {
-                guard var other = result.frame(for: neighbor), Self.conflicts(frame, other) else { continue }
-                other.origin.y = frame.maxY + Self.gap
-                result.positions[neighbor] = CGPoint(x: other.midX, y: other.midY)
-                queue.append(neighbor)
+        for item in ordered { result.heights[item.id] = NoteMetrics.height(for: item) }
+        let missing = ordered.filter { result.positions[$0.id] == nil }
+        if !missing.isEmpty {
+            // The automatic layout supplies urgency-based targets, never replacement positions.
+            let targets = layout(items: ordered, now: now, viewport: viewport)
+            var occupied = ids.compactMap { result.frame(for: $0) } + reserved
+            for item in missing {
+                let point = vacant(near: targets.positions[item.id] ?? .zero, height: result.heights[item.id]!, occupied: occupied)
+                result.positions[item.id] = point
+                occupied.append(Self.frame(at: point, height: result.heights[item.id]!))
             }
         }
-        let frames = ids.compactMap { result.frame(for: $0) } + reserved
-        result.bounds = frames.reduce(CGRect.null) { $0.union($1) }
+        let known = Set(result.stackingOrder)
+        result.stackingOrder.append(contentsOf: ordered.map(\.id).filter { !known.contains($0) })
+        result.updateBounds(visibleIDs: ids, reserved: reserved)
         return result
+    }
+
+    private func vacant(near target: CGPoint, height: CGFloat, occupied: [CGRect]) -> CGPoint {
+        var candidates = [target]
+        for frame in occupied {
+            let xs = [frame.minX - Self.gap - NoteMetrics.width / 2, frame.maxX + Self.gap + NoteMetrics.width / 2]
+            let ys = [frame.minY - Self.gap - height / 2, frame.maxY + Self.gap + height / 2]
+            candidates += xs.map { CGPoint(x: $0, y: target.y) }
+            candidates += ys.map { CGPoint(x: target.x, y: $0) }
+            candidates += xs.flatMap { x in ys.map { CGPoint(x: x, y: $0) } }
+        }
+        return candidates.filter { point in
+            !occupied.contains { Self.conflicts(Self.frame(at: point, height: height), $0) }
+        }.min { a, b in
+            Self.nearer(CGPoint(x: a.x - target.x, y: a.y - target.y), CGPoint(x: b.x - target.x, y: b.y - target.y))
+        } ?? target // With finite rectangles, the outermost top/bottom candidate is always free.
     }
 
     static func frame(at center: CGPoint, height: CGFloat = NoteMetrics.minimumHeight) -> CGRect {
@@ -111,5 +121,12 @@ struct BoardLayoutEngine {
         if abs(l - r) > 0.01 { return l < r }
         if a.y != b.y { return a.y < b.y }
         return a.x < b.x
+    }
+}
+
+extension BoardLayout {
+    mutating func updateBounds(visibleIDs: Set<UUID>, reserved: [CGRect] = []) {
+        let extent = (visibleIDs.compactMap { frame(for: $0) } + reserved).reduce(CGRect.null) { $0.union($1) }
+        bounds = extent.isNull ? .zero : extent
     }
 }

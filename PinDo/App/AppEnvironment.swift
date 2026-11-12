@@ -142,20 +142,3 @@ final class AppEnvironment: ObservableObject {
     }
 }
 
-@MainActor
-final class ApplicationDelegate: NSObject, NSApplicationDelegate {
-    weak var environment: AppEnvironment?
-    private var quitting = false
-
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard !quitting, let environment else { return quitting ? .terminateLater : .terminateNow }
-        quitting = true
-        Task {
-            let canQuit = await environment.prepareToQuit()
-            quitting = false
-            sender.reply(toApplicationShouldTerminate: canQuit)
-        }
-        return .terminateLater
-    }
-}
-
