@@ -65,7 +65,9 @@ enum SyncBuilder {
             if stored == nil { try add(entity, "identity", SyncIdentity(id: item.id, createdAt: item.createdAt, updatedAt: item.updatedAt)) }
             if prior?.title != item.title { try add(entity, "title", item.title, parents: parents("title")) }
             if prior?.notes != item.notes { try add(entity, "notes", item.notes, parents: parents("notes")) }
-            if prior == nil || prior?.dueAt != item.dueAt { try add(entity, "deadline", item.dueAt, parents: parents("deadline")) }
+            if prior == nil || prior?.schedule != item.schedule {
+                change.writes.append(SyncWrite(entity: entity, field: "deadline", parents: parents("deadline") ?? graph.editParents(entity, "deadline"), value: try item.schedule.encodeSync()))
+            }
             if prior?.stars != item.stars { try add(entity, "stars", item.stars, parents: parents("stars")) }
             let event = (stored == nil && compact ? after.events : newEvents).first { $0.itemID == item.id &&
                 (stored == nil ? ($0.kind == .completed && item.status == .completed || $0.kind == .abandoned && item.status == .abandoned) : [.completed, .abandoned, .completionUndone].contains($0.kind)) }
@@ -87,7 +89,7 @@ enum SyncBuilder {
                 let observed: [UUID]?
                 if let event, event.kind == .completionUndone, let completion = event.relatedCompletionID { observed = [completion] }
                 else { observed = nil }
-                try add(entity, "lifecycle", SyncLife(status: item.status.rawValue, date: item.completedAt ?? item.abandonedAt), parents: observed, id: event?.id ?? UUID())
+                try add(entity, "lifecycle", SyncLife(status: item.status.rawValue, date: item.completedAt ?? item.abandonedAt, completionSchedule: item.completionSchedule), parents: observed, id: event?.id ?? UUID())
             }
             for assignment in item.projectAssignments where !(stored?.projectAssignments.contains(assignment) ?? false) {
                 // Automatic transfers are derived from immutable project generations on every device.

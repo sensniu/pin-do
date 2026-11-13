@@ -36,6 +36,10 @@ struct NoteEditorView: View {
         if draft == initial { cancel() } else { editor.discardConfirmation = true }
     }
 
+    private var startLabel: String {
+        guard let start = draft.plannedStartAt else { return "安排预计开始" }
+        return "预计开始：" + (draft.startIsNow == true ? "现在" : DeadlineText.label(start, now: now))
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
@@ -76,7 +80,11 @@ struct NoteEditorView: View {
                                     Button("清除时间") { editor.draft.hasDeadline = false; editor.editingDate = false }
                                     Spacer()
                                     Button("确定") {
-                                        editor.draft.dueAt = editor.proposedDate; editor.draft.hasDeadline = true; editor.editingDate = false
+                                        let time = NoteDraft.minute(Date.now)
+                                        if !draft.hasDeadline, draft.plannedStartAt == nil, editor.proposedDate >= time {
+                                            editor.draft.plannedStartAt = time; editor.draft.startIsNow = true
+                                        }
+                                        editor.draft.dueAt = NoteDraft.minute(editor.proposedDate); editor.draft.hasDeadline = true; editor.editingDate = false
                                     }
                                 }
                             }.padding(20).frame(width: 330)
@@ -91,6 +99,31 @@ struct NoteEditorView: View {
                                 .lineLimit(1)
                         }.menuStyle(.borderlessButton).accessibilityLabel("所属项目")
                     }.font(.system(size: 12)).opacity(appearance.secondaryOpacity)
+                    if draft.hasDeadline {
+                        HStack(spacing: 8) {
+                            Button {
+                                editor.proposedStart = draft.plannedStartAt ?? NoteDraft.minute(Date.now)
+                                editor.editingStart = true
+                            } label: {
+                                Label(startLabel, systemImage: "clock")
+                            }.buttonStyle(.plain).accessibilityIdentifier("planned-start")
+                            Spacer(minLength: 0)
+                        }.font(.system(size: 12)).opacity(appearance.secondaryOpacity)
+                            .popover(isPresented: $editor.editingStart) {
+                                VStack(alignment: .leading, spacing: 14) {
+                                    Text("预计开始").font(.headline)
+                                    DatePicker("日期与时间", selection: $editor.proposedStart, displayedComponents: [.date, .hourAndMinute]).datePickerStyle(.field)
+                                    Text("计划开始时间，不代表实际投入工时。").font(.caption).foregroundStyle(.secondary)
+                                    HStack {
+                                        Button("清除开始") { editor.draft.plannedStartAt = nil; editor.draft.startIsNow = nil; editor.editingStart = false }
+                                        Button("现在") { editor.draft.plannedStartAt = NoteDraft.minute(Date.now); editor.draft.startIsNow = true; editor.editingStart = false }
+                                        Spacer()
+                                        Button("确定") { editor.draft.plannedStartAt = NoteDraft.minute(editor.proposedStart); editor.draft.startIsNow = false; editor.editingStart = false }
+                                    }
+                                }.padding(20).frame(width: 370)
+                            }
+                        if let message = draft.scheduleError { Text(message).font(.caption).foregroundStyle(.red) }
+                    }
                     if editor.notesExpanded {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("备注").font(.system(size: 11)).opacity(appearance.secondaryOpacity)
@@ -121,7 +154,7 @@ struct NoteEditorView: View {
                     .help("保存 ⌘↩")
             }.controlSize(.large).padding(20)
         }
-        .frame(width: 470, height: min(maxHeight, editor.notesExpanded ? 510 : 310))
+        .frame(width: 470, height: min(maxHeight, editor.notesExpanded ? 550 : (draft.hasDeadline ? 365 : 310)))
         .foregroundStyle(appearance.ink).tint(appearance.ink)
         .environment(\.colorScheme, appearance.ink == .white ? .dark : .light)
         .background(appearance.fill, in: RoundedRectangle(cornerRadius: 12))

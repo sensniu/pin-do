@@ -6,16 +6,16 @@ final class LifecycleTests: XCTestCase {
     func testDefaultWindowTracksAvailableScreenAndOccupiesAboutTwoThirds() {
         for visible in [CGRect(x:0,y:40,width:1512,height:900),CGRect(x:-2560,y:80,width:2560,height:1360)] {
             let frame = WindowSizing.frame(visible:visible,restored:nil,minimum:CGSize(width:760,height:582),upgrade:false)
-            XCTAssertEqual(frame.width,visible.width*0.82,accuracy:0.001)
-            XCTAssertEqual(frame.height,visible.height*0.82,accuracy:0.001)
+            XCTAssertEqual(frame.width,visible.width*sqrt(0.65),accuracy:0.001)
+            XCTAssertEqual(frame.height,visible.height*sqrt(0.65),accuracy:0.001)
             XCTAssertEqual(frame.midX,visible.midX,accuracy:0.001); XCTAssertEqual(frame.midY,visible.midY,accuracy:0.001)
-            XCTAssertTrue(visible.contains(frame)); XCTAssertLessThan(frame.width*frame.height/(visible.width*visible.height),0.70)
+            XCTAssertTrue(visible.contains(frame)); XCTAssertEqual(frame.width*frame.height/(visible.width*visible.height),0.65,accuracy:0.0001)
         }
     }
     func testWindowSizingUpgradeEnlargesOnlyUndersizedDimensionsOnce() {
         let visible = CGRect(x:0,y:50,width:1800,height:1100), old = CGRect(x:40,y:100,width:1550,height:600)
         let new = WindowSizing.frame(visible:visible,restored:old,minimum:CGSize(width:760,height:582),upgrade:true)
-        XCTAssertEqual(new.width,1550); XCTAssertEqual(new.height,902,accuracy:0.001)
+        XCTAssertEqual(new.width,1550); XCTAssertEqual(new.height,1100*sqrt(0.65),accuracy:0.001)
         let manual = CGRect(x:0,y:50,width:900,height:650)
         XCTAssertEqual(WindowSizing.frame(visible:visible,restored:manual,minimum:CGSize(width:760,height:582),upgrade:false),manual)
     }

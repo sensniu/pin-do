@@ -518,3 +518,50 @@ final class SyncV3Tests: XCTestCase {
         XCTAssertFalse(BootstrapDAVProtocol.server.filePaths.contains { $0.contains("_work/") })
     }
 }
+
+final class ScheduleSyncTests: XCTestCase {
+    @MainActor
+    func testLegacyCloudUpgradesInPlaceAndConcurrentSchedulesStayAtomic() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-schedule-sync-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let a = try TodoRepository(paths: AppPaths(root: folder.appendingPathComponent("a")), appVersion: "1.1.0")
+        let b = try TodoRepository(paths: AppPaths(root: folder.appendingPathComponent("b")), appVersion: "1.1.0")
+        let item = TodoItem(title: "并发安排", dueAt: now.addingTimeInterval(7200), createdAt: now)
+        try a.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        try a.initializeSync(); try b.initializeSync()
+        let dav = MemoryDAV(), ca = SyncCoordinator(), cb = SyncCoordinator()
+        ca.attach(a); cb.attach(b)
+        let identity = UUID()
+        try await dav.create("library.json", data: SyncCodec.wrap(SyncLibrary(version: 3, id: identity)))
+        _ = try await ca.exchange(using: dav); _ = try await cb.exchange(using: dav)
+        let root = try SyncCodec.unwrap(SyncLibrary.self, await dav.get("library.json").data)
+        XCTAssertEqual(root.id, identity); XCTAssertEqual(root.version, 4)
+        var left = try XCTUnwrap(a.storedItem(item.id)), right = try XCTUnwrap(b.storedItem(item.id))
+        left.plannedStartAt = now.addingTimeInterval(3600)
+        right.dueAt = now.addingTimeInterval(1800); right.plannedStartAt = now
+        try a.commit(left, event: TodoEvent(itemID: item.id, kind: .edited, occurredAt: now), clearDraft: true)
+        try b.commit(right, event: TodoEvent(itemID: item.id, kind: .edited, occurredAt: now), clearDraft: true)
+        _ = try await ca.exchange(using: dav); _ = try await cb.exchange(using: dav); _ = try await ca.exchange(using: dav)
+        let graph = try SyncGraph(XCTUnwrap(a.syncState()).changes)
+        let conflict = try XCTUnwrap(graph.conflicts().first { $0.field == "deadline" })
+        let options = try conflict.candidates.map { try TodoSchedule.decodeSync($0.value) }
+        XCTAssertEqual(Set(options.map { $0.startAt! }), Set([left.plannedStartAt!, right.plannedStartAt!]))
+        XCTAssertTrue(options.contains(left.schedule)); XCTAssertTrue(options.contains(right.schedule))
+        XCTAssertTrue(try XCTUnwrap(a.storedItem(item.id)).schedule.isValid)
+        try a.resolveSyncConflict(conflict, candidate: XCTUnwrap(conflict.candidates.first { (try? TodoSchedule.decodeSync($0.value)) == left.schedule }))
+        _ = try await ca.exchange(using: dav); _ = try await cb.exchange(using: dav)
+        XCTAssertEqual(try b.storedItem(item.id)?.schedule, left.schedule)
+        var complete = try XCTUnwrap(a.storedItem(item.id)); complete.status = .completed; complete.completedAt = now.addingTimeInterval(5400)
+        try a.commit(complete, event: TodoEvent(itemID: item.id, kind: .completed, occurredAt: complete.completedAt!), clearDraft: true)
+        _ = try await ca.exchange(using: dav); _ = try await cb.exchange(using: dav)
+        XCTAssertEqual(try b.storedItem(item.id)?.completionSchedule?.startAt, left.plannedStartAt)
+        let puts = await dav.puts
+        _ = try await ca.exchange(using: dav)
+        let after = await dav.puts
+        XCTAssertEqual(after, puts)
+        let paths = await dav.files.keys
+        XCTAssertFalse(paths.contains { $0.hasPrefix("_work/") })
+        _ = try BackupCodec.decode(BackupCodec.encode(a.archive()))
+    }
+}

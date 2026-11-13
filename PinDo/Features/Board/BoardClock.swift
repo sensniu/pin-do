@@ -30,7 +30,7 @@ final class BoardClock: ObservableObject {
     func update(items: [TodoItem]) {
         timer?.invalidate()
         let current = Date.now
-        let nextDeadline = items.compactMap(\.dueAt).filter { $0 > current }.min()
+        let nextDeadline = items.flatMap { [$0.plannedStartAt, $0.dueAt].compactMap { $0 } }.filter { $0 > current }.min()
         let untilDeadline = nextDeadline?.timeIntervalSince(current) ?? 60
         let delay = max(0.05, min(60, untilDeadline))
         let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in

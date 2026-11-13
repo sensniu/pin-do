@@ -61,7 +61,7 @@ struct AnalyticsDetailView: View {
 
     private var context: String {
         switch model.detail {
-        case .completed, .created, .abandoned, .createdBucket, .completedBucket, .completionDay, .lifetime, .lifetimeAll, .lifetimeIssues:
+        case .completed, .created, .abandoned, .createdBucket, .completedBucket, .completionDay, .lifetime, .lifetimeAll, .lifetimeIssues, .scheduleSamples, .earlySchedule:
             return result.periodLabel
         case .project(_, .completed): return result.periodLabel
         case .record: return "本地当前保存内容"
@@ -92,7 +92,14 @@ struct AnalyticsDetailView: View {
             Text("创建：" + timestamp(item.createdAt))
             if result.input.issues[item.id, default: []].contains("deadline") { Text("截止时间待确认").foregroundStyle(.orange) }
             else { Text("截止：" + (item.dueAt.map(timestamp) ?? "无截止时间")) }
+            if let start = item.plannedStartAt { Text("预计开始：" + timestamp(start)) }
             if let date = item.completedAt, item.status == .completed { Text("完成：" + timestamp(date)) }
+            if let snapshot = item.completionSchedule {
+                if let start = snapshot.startAt { Text("完成时的预计开始：" + timestamp(start)) }
+                if let due = snapshot.dueAt { Text("完成时的截止：" + timestamp(due)) }
+                if let span = result.review.schedules.spans[item.id] { Text("计划开始至完成：" + AnalyticsReview.durationLabel(span) + "（含等待）") }
+                if result.review.schedules.early.contains(item.id) { Text("提前于预计开始完成，未计入开始至完成跨度。").foregroundStyle(.secondary) }
+            }
             if let date = item.abandonedAt, item.status == .abandoned { Text("放弃：" + timestamp(date)) }
             if let duration = result.review.durations[item.id] { Text("创建至完成：" + AnalyticsReview.durationLabel(duration) + "（含等待）") }
             if result.review.lifetimeIssues.contains(item.id) { Text("创建与完成时间待核对，未纳入跨度计算。").foregroundStyle(.orange) }

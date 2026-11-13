@@ -211,7 +211,10 @@ final class SyncCoordinator: ObservableObject {
             guard response.status == 200 else { throw SyncFailure.http(response.status) }
             library = try SyncCodec.unwrap(SyncLibrary.self, response.data)
         }
-        guard library.version == 3 else { throw SyncFailure.unsupported }
+        guard [3, 4].contains(library.version) else { throw SyncFailure.unsupported }
+        // Upgrade the existing identity in place before publishing extended schedules.
+        // v1.0 checks this marker on every exchange and stops instead of dropping new data.
+        if library.version == 3 { try await upgradeScheduleLibrary(dav, id: library.id) }
         if response.status == 200, let proposal = initial.proposedLibraryID {
             // Recover a first-create staging cleanup after an interrupted request or another creator winning.
             do { try await dav.create("library.json", data: SyncCodec.wrap(SyncLibrary(id: proposal))) }
@@ -249,6 +252,24 @@ final class SyncCoordinator: ObservableObject {
         more = more || state.pendingCount > 0 || !state.current!.inbox.isEmpty || state.current!.cleanupPending == true
         if !more { state.lastSuccess = .now; try repository.saveSyncState(state) }
         return more
+    }
+    private func upgradeScheduleLibrary(_ dav: any DAVTransport, id: UUID) async throws {
+        for _ in 0..<5 {
+            let response = try await dav.get("library.json")
+            guard response.status == 200 else { throw SyncFailure.http(response.status) }
+            let root = try SyncCodec.unwrap(SyncLibrary.self, response.data)
+            guard root.id == id else { throw SyncFailure.wrongLibrary }
+            if root.version == 4 { return }
+            guard root.version == 3 else { throw SyncFailure.unsupported }
+            guard let tag = DAVProbe.usableTag(response.etag) else { throw SyncFailure.unsafeServer }
+            let update = try await dav.request("PUT", path: "library.json", body: SyncCodec.wrap(SyncLibrary(id: id)), headers: ["If-Match": tag])
+            if update.status == 412 { continue }
+            guard [200, 201, 204].contains(update.status) else { throw SyncFailure.http(update.status) }
+            // Read back on the next iteration, including lost-response recovery on retry.
+        }
+        let response = try await dav.get("library.json")
+        let root = try SyncCodec.unwrap(SyncLibrary.self, response.data)
+        guard response.status == 200, root.id == id, root.version == 4 else { throw SyncFailure.identityCollision }
     }
     func readCurrentIndex(_ dav: any DAVTransport, library: UUID) async throws -> SyncCurrentIndex {
         let response = try await dav.get("index.json")
@@ -386,7 +407,11 @@ final class SyncCoordinator: ObservableObject {
     func describe(_ write: SyncWrite) -> String {
         switch write.field {
         case "title", "notes", "name": return (try? SyncCodec.decode(String.self, write.value)) ?? ""
-        case "deadline": return (try? SyncCodec.decode(Date?.self, write.value))?.formatted(date: .abbreviated, time: .shortened) ?? "无截止时间"
+        case "deadline":
+            guard let schedule = try? TodoSchedule.decodeSync(write.value) else { return "时间安排待核对" }
+            let parts = [schedule.startAt.map { "预计开始：" + $0.formatted(date: .abbreviated, time: .shortened) },
+                    schedule.dueAt.map { "截止：" + $0.formatted(date: .abbreviated, time: .shortened) }].compactMap { $0 }
+            return parts.isEmpty ? "无截止时间" : parts.joined(separator: "\n")
         case "stars": return "\((try? SyncCodec.decode(Int.self, write.value)) ?? 1) 颗星"
         case "lifecycle":
             let status = (try? SyncCodec.decode(SyncLife.self, write.value))?.status ?? ""

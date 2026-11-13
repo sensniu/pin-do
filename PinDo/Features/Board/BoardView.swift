@@ -37,7 +37,7 @@ struct BoardView: View {
                                     scale: scale, pan: session.pan
                                 )
                                 StickyNoteView(
-                                    item: item, now: clock.now, height: model.layout.heights[item.id] ?? NoteMetrics.height(for: item), project: model.project(item.projectID), showsProjectBorder: model.selectedScope == .all, overview: scale < 0.7,
+                                    item: item, now: clock.now, height: model.layout.heights[item.id] ?? NoteMetrics.height(for: item), project: model.project(item.projectID), showsProjectBorder: model.selectedScope == .all, overview: scale < 0.7, schedulePending: model.scheduleIssues.contains(item.id),
                                     edit: { withAnimation(animation) { model.edit(item) } },
                                     complete: { withAnimation(animation) { model.complete(item.id) } }
                                 )

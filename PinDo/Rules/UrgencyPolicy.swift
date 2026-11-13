@@ -59,3 +59,49 @@ enum DeadlineText {
         return formatter.string(from: date)
     }
 }
+
+
+/// Derived display state only. It is never persisted or uploaded as a progress event.
+struct SchedulePresentation: Equatable {
+    enum Phase: Equatable { case none, deadlineOnly, waiting, available, overdue, pending }
+    let phase: Phase
+    let range: String
+    let fallback: String
+    let detail: String
+    let fraction: Double?
+    init(item: TodoItem, now: Date, pending: Bool = false, calendar: Calendar = .current) {
+        guard !pending else {
+            phase = .pending; range = "安排待确认"; fallback = range
+            detail = "不同设备的时间安排尚未确认，请在同步设置中选择。"; fraction = nil; return
+        }
+        guard let due = item.dueAt else {
+            phase = .none; range = "无截止时间"; fallback = range; detail = range; fraction = nil; return
+        }
+        let dueLabel = DeadlineText.label(due, now: now, calendar: calendar)
+        let overdue = now >= due
+        fallback = now == due ? "已到截止" : overdue ? "已逾期" + Self.duration(now.timeIntervalSince(due)) : dueLabel + "截止"
+        if let start = item.plannedStartAt {
+            phase = overdue ? .overdue : now < start ? .waiting : .available
+            let startLabel = DeadlineText.label(start, now: now, calendar: calendar)
+            if overdue { range = fallback }
+            else if calendar.isDate(start, inSameDayAs: due) {
+                let format = DateFormatter(); format.calendar = calendar; format.timeZone = calendar.timeZone; format.dateFormat = "HH:mm"
+                range = startLabel + " → " + format.string(from: due)
+            } else { range = startLabel + " → " + dueLabel }
+            fraction = due > start ? min(1, max(0, now.timeIntervalSince(start) / due.timeIntervalSince(start))) : nil
+            detail = "预计开始：" + start.formatted(date: .abbreviated, time: .shortened) + "\n截止：" + due.formatted(date: .abbreviated, time: .shortened)
+                + "\n" + (now < start ? "距开始" + Self.duration(start.timeIntervalSince(now)) : overdue ? fallback : "距截止" + Self.duration(due.timeIntervalSince(now)))
+                + "\n时间条表示计划时间的消耗，不代表任务完成比例。"
+        } else {
+            phase = overdue ? .overdue : .deadlineOnly; range = fallback; fraction = nil
+            detail = "截止：" + due.formatted(date: .abbreviated, time: .shortened)
+        }
+    }
+    static func duration(_ seconds: TimeInterval) -> String {
+        guard seconds.isFinite, seconds < 1e12 else { return "很久" }
+        let minutes = max(0, Int(ceil(seconds / 60)))
+        if minutes < 60 { return "\(minutes)分钟" }
+        let hours = minutes / 60
+        return hours < 24 ? "\(hours)小时" : "\(hours / 24)天\(hours % 24)小时"
+    }
+}

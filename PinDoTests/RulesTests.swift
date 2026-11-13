@@ -196,3 +196,72 @@ final class RulesTests: XCTestCase {
 
 }
 
+
+final class ScheduleRulesTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    func testLegacyPayloadsHaveNoInventedStartOrCompletionContext() throws {
+        let item = TodoItem(title: "旧事项", dueAt: now, createdAt: now)
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(item)) as? [String: Any])
+        json.removeValue(forKey: "plannedStartAt"); json.removeValue(forKey: "completionSchedule")
+        let decoded = try JSONDecoder().decode(TodoItem.self, from: JSONSerialization.data(withJSONObject: json))
+        XCTAssertNil(decoded.plannedStartAt); XCTAssertNil(decoded.completionSchedule)
+        XCTAssertNil(NoteDraft(item: decoded, now: now.addingTimeInterval(86400)).plannedStartAt)
+        XCTAssertEqual(try TodoSchedule.decodeSync(SyncCodec.encode(Optional(now))), TodoSchedule(startAt: nil, dueAt: now))
+        XCTAssertEqual(try TodoSchedule.decodeSync(Data("null".utf8)), TodoSchedule(startAt: nil, dueAt: nil))
+    }
+    func testScheduleValidationAndNowResolveAtSaveWithoutChangingExistingDates() throws {
+        var draft = NoteDraft(now: now); draft.title = "安排"; draft.hasDeadline = true
+        draft.dueAt = now.addingTimeInterval(3600); draft.plannedStartAt = now; draft.startIsNow = true
+        XCTAssertEqual(draft.resolvedStart(at: now.addingTimeInterval(600)), NoteDraft.minute(now.addingTimeInterval(600)))
+        draft.startIsNow = false
+        XCTAssertEqual(draft.resolvedStart(at: now.addingTimeInterval(600)), now)
+        draft.plannedStartAt = draft.dueAt
+        XCTAssertTrue(draft.canSubmit)
+        draft.plannedStartAt = draft.dueAt.addingTimeInterval(60)
+        XCTAssertFalse(draft.canSubmit); XCTAssertNotNil(draft.scheduleError)
+        draft.hasDeadline = false
+        XCTAssertTrue(draft.canSubmit); XCTAssertNil(draft.resolvedStart(at: now))
+        XCTAssertThrowsError(try TodoSchedule(startAt: now, dueAt: nil).encodeSync())
+        XCTAssertThrowsError(try TodoSchedule.decodeSync(Data("{}".utf8)))
+    }
+    func testTimelineShowsElapsedWindowAndHandlesInstantAndPendingSchedules() {
+        var item = TodoItem(title: "时间条", dueAt: now.addingTimeInterval(7200), plannedStartAt: now.addingTimeInterval(-7200))
+        let half = SchedulePresentation(item: item, now: now)
+        XCTAssertEqual(half.phase, .available); XCTAssertEqual(half.fraction, 0.5)
+        let atDeadline = SchedulePresentation(item: item, now: now.addingTimeInterval(7200))
+        XCTAssertEqual(atDeadline.phase, .overdue); XCTAssertEqual(atDeadline.range, "已到截止")
+        XCTAssertEqual(SchedulePresentation(item: item, now: now.addingTimeInterval(-10800)).phase, .waiting)
+        XCTAssertEqual(SchedulePresentation(item: item, now: now.addingTimeInterval(7201)).fraction, 1)
+        XCTAssertNil(SchedulePresentation(item: item, now: now, pending: true).fraction)
+        XCTAssertEqual(SchedulePresentation(item: item, now: now, pending: true).phase, .pending)
+        item.plannedStartAt = item.dueAt
+        XCTAssertNil(SchedulePresentation(item: item, now: now).fraction)
+        item.plannedStartAt = nil; item.dueAt = nil
+        XCTAssertEqual(SchedulePresentation(item: item, now: now).phase, .none)
+    }
+    func testFooterAddsAtMostTenPointsAndKeepsShortCardsCompact() {
+        for notes in ["", "一段备注", String(repeating: "较长的说明内容", count: 70)] {
+            var item = TodoItem(title: "保持正文完整的任务标题", notes: notes, dueAt: now.addingTimeInterval(3600))
+            let original = NoteMetrics.height(for: item)
+            item.plannedStartAt = now
+            XCTAssertLessThanOrEqual(NoteMetrics.height(for: item) - original, 10)
+            XCTAssertLessThanOrEqual(NoteMetrics.height(for: item), 200)
+        }
+    }
+    func testScheduleStatisticsUseCompletionSnapshotAndExcludeEarlyOrConflictedSpans() {
+        func finished(_ hours: Double, start: Date = Date(timeIntervalSince1970: 1_800_000_000)) -> TodoItem {
+            var item = TodoItem(title: "样本", dueAt: now.addingTimeInterval(99 * 3600))
+            item.status = .completed; item.completedAt = now.addingTimeInterval(hours * 3600)
+            item.completionSchedule = CompletionSchedule(startAt: start, dueAt: now.addingTimeInterval(4 * 3600))
+            return item
+        }
+        let a = finished(2), b = finished(6), early = finished(-1), conflict = finished(100)
+        var legacy = finished(2); legacy.completionSchedule = nil
+        let stats = ScheduleStatistics(completed: [a, b, early, conflict, legacy], issues: [conflict.id: ["deadline"]])
+        XCTAssertEqual(stats.averageSpan, 4 * 3600); XCTAssertEqual(stats.medianSpan, 4 * 3600)
+        XCTAssertEqual(stats.averageWindow, 4 * 3600); XCTAssertEqual(stats.early, [early.id])
+        XCTAssertEqual(stats.deadlineSamples.count, 3); XCTAssertEqual(stats.onTime.count, 2)
+        XCTAssertFalse(stats.sampleIDs.contains(legacy.id)); XCTAssertFalse(stats.spans.values.contains(0))
+    }
+}

@@ -2,7 +2,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-final class NoteHoverState: ObservableObject { @Published var hovering = false }
+final class NoteHoverState: ObservableObject { @Published var hovering = false; @Published var emphasizingTime = false }
 
 struct StickyNoteView: View {
     let item: TodoItem
@@ -11,12 +11,14 @@ struct StickyNoteView: View {
     let project: Project?
     var showsProjectBorder = true
     var overview = false
+    var schedulePending = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let edit: () -> Void
     let complete: () -> Void
     @EnvironmentObject private var settings: AppearanceSettings
     @Environment(\.colorScheme) private var scheme
     @StateObject private var hover = NoteHoverState()
-    private var urgency: Urgency { UrgencyPolicy().evaluate(dueAt: item.dueAt, now: now) }
+    private var urgency: Urgency { UrgencyPolicy().evaluate(dueAt: schedulePending ? nil : item.dueAt, now: now) }
     private var appearance: NoteAppearance { NoteAppearance(urgency: urgency, scheme: scheme, palette: settings.palette) }
 
     var body: some View {
@@ -50,13 +52,7 @@ struct StickyNoteView: View {
                             .fixedSize(horizontal: false, vertical: true).opacity(appearance.secondaryOpacity)
                     }
                     Spacer(minLength: 0)
-                    HStack(spacing: 4) {
-                        if urgency.isOverdue { Image(systemName: "clock.badge.exclamationmark"); Text("已逾期") }
-                        Text(DeadlineText.label(item.dueAt, now: now))
-                    }
-                    .font(.system(size: 11, weight: urgency.isOverdue ? .medium : .regular))
-                    .opacity(appearance.secondaryOpacity).lineLimit(1).minimumScaleFactor(0.9)
-                    .help(item.dueAt?.formatted(date: .complete, time: .shortened) ?? "无截止时间")
+                    timeFooter
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .contentShape(Rectangle())
@@ -75,5 +71,48 @@ struct StickyNoteView: View {
         .shadow(color: .black.opacity(scheme == .dark ? 0.2 : (hover.hovering ? 0.12 : 0.06)), radius: hover.hovering ? 9 : 4, y: hover.hovering ? 4 : 2)
         .onHover { hover.hovering = $0 }
         .accessibilityElement(children: .contain)
+        .onChange(of: timeline.phase) { old, new in
+            guard !reduceMotion, NSApp.isActive, NSApp.keyWindow?.isVisible == true,
+                  old != .pending, new == .available || new == .overdue else { return }
+            let boundary = new == .overdue ? item.dueAt : item.plannedStartAt
+            guard let boundary, now.timeIntervalSince(boundary) >= 0, now.timeIntervalSince(boundary) < 75 else { return }
+            Task { @MainActor in
+                withAnimation(.easeOut(duration: 0.18)) { hover.emphasizingTime = true }
+                try? await Task.sleep(for: .milliseconds(700))
+                withAnimation(.easeOut(duration: 0.35)) { hover.emphasizingTime = false }
+            }
+        }
     }
+    private var timeline: SchedulePresentation { SchedulePresentation(item: item, now: now, pending: schedulePending) }
+    private var timeFooter: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 4) {
+                if timeline.phase == .pending { Image(systemName: "exclamationmark.circle") }
+                else if urgency.isOverdue { Image(systemName: "clock.badge.exclamationmark") }
+                else if item.plannedStartAt != nil { Image(systemName: timeline.phase == .waiting ? "clock" : "hourglass") }
+                ViewThatFits(in: .horizontal) {
+                    Text(timeline.range).fixedSize(horizontal: true, vertical: false)
+                    Text(timeFallback).lineLimit(1)
+                }
+            }
+            .font(.system(size: 11, weight: urgency.isOverdue ? .medium : .regular)).monospacedDigit()
+            .opacity(hover.emphasizingTime ? 1 : appearance.secondaryOpacity)
+            if let fraction = timeline.fraction {
+                GeometryReader { geometry in
+                    Capsule().fill(appearance.ink.opacity(0.10))
+                        .overlay(alignment: .leading) {
+                            Capsule().fill(appearance.ink.opacity(hover.emphasizingTime ? 0.8 : 0.4))
+                                .frame(width: max(0, geometry.size.width * fraction))
+                        }
+                }.frame(height: 3).accessibilityHidden(true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .help(timeline.detail).accessibilityElement(children: .ignore).accessibilityLabel(timeline.detail)
+    }
+    private var timeFallback: String {
+        if timeline.phase == .waiting, let start = item.plannedStartAt { return DeadlineText.label(start, now: now) + "开始" }
+        return timeline.fallback
+    }
+
 }

@@ -147,7 +147,7 @@ extension SyncCoordinator {
                 }
                 try await advertiseCurrent([latest], dav: dav, library: library)
                 _ = try await dav.deleteWorkFile(path, response: response)
-            } else if let root = try? SyncCodec.unwrap(SyncLibrary.self, response.data), root.version == 3 {
+            } else if let root = try? SyncCodec.unwrap(SyncLibrary.self, response.data), [3, 4].contains(root.version) {
                 _ = try await dav.deleteWorkFile(path, response: response)
             } else if let index = try? SyncCodec.unwrap(SyncCurrentIndex.self, response.data), index.version == 3, index.libraryID == library, index.records.isEmpty {
                 _ = try await dav.deleteWorkFile(path, response: response)

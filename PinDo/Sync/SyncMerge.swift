@@ -71,7 +71,7 @@ struct SyncGraph {
         case "title", "name":
             guard !(try SyncCodec.decode(String.self, write.value)).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw SyncFailure.invalidData }
         case "notes": _ = try SyncCodec.decode(String.self, write.value)
-        case "deadline": _ = try SyncCodec.decode(Date?.self, write.value)
+        case "deadline": _ = try TodoSchedule.decodeSync(write.value)
         case "stars": guard (1...3).contains(try SyncCodec.decode(Int.self, write.value)) else { throw SyncFailure.invalidData }
         case "color": guard try SyncCodec.decode(ProjectColor.self, write.value).isValid else { throw SyncFailure.invalidData }
         case "membership":
@@ -80,6 +80,8 @@ struct SyncGraph {
             if let dot = value.generationDot { guard value.projectID != nil, dot.counter > 0 else { throw SyncFailure.invalidData } }
         case "lifecycle":
             let value = try SyncCodec.decode(SyncLife.self, write.value)
+            guard value.completionSchedule?.schedule.isValid ?? true,
+                  value.completionSchedule == nil || value.status == "completed" else { throw SyncFailure.invalidData }
             let allowed = write.entity.hasPrefix("todo:") ? ["active", "completed", "abandoned"] : ["active", "archived", "deleted"]
             guard allowed.contains(value.status), (value.status == "active") == (value.date == nil) else { throw SyncFailure.invalidData }
             if let dot = value.generation { guard value.status == "active", dot.counter > 0 else { throw SyncFailure.invalidData } }
@@ -176,11 +178,14 @@ struct SyncGraph {
             guard entity == Self.entity("todo", identity.id) else { throw SyncFailure.invalidData }
             let life = try value(SyncLife.self, entity, "lifecycle")
             let membership = try value(SyncMembership.self, entity, "membership")
+            let schedule = try TodoSchedule.decodeSync(selected(entity, "deadline").value)
             var item = TodoItem(id: identity.id, title: try value(String.self, entity, "title"), notes: try value(String.self, entity, "notes"),
-                                dueAt: try value(Date?.self, entity, "deadline"), stars: try value(Int.self, entity, "stars"), projectID: membership.projectID, createdAt: identity.createdAt)
+                                dueAt: schedule.dueAt, stars: try value(Int.self, entity, "stars"), projectID: membership.projectID, createdAt: identity.createdAt)
+            item.plannedStartAt = schedule.startAt
             guard let status = TodoStatus(rawValue: life.status) else { throw SyncFailure.invalidData }
             item.status = conflicts.contains(where: { $0.entity == entity && $0.field == "lifecycle" }) ? .conflicted : status
             item.completedAt = item.status == .completed ? life.date : nil
+            item.completionSchedule = item.status == .completed ? life.completionSchedule : nil
             item.abandonedAt = item.status == .abandoned ? life.date : nil
             item.updatedAt = updated(entity, fallback: identity.updatedAt ?? identity.createdAt)
             item.projectAssignments = assignments.values.filter { $0.itemID == item.id }

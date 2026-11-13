@@ -110,6 +110,8 @@ struct StoreArchive: Codable, Sendable {
               (1...3).contains(item.stars), item.createdAt.timeIntervalSince1970.isFinite,
               item.updatedAt.timeIntervalSince1970.isFinite,
               item.dueAt?.timeIntervalSince1970.isFinite ?? true else { throw StoreFailure.invalidItem }
+        guard item.schedule.isValid, item.completionSchedule?.schedule.isValid ?? true,
+              item.completionSchedule == nil || item.status == .completed else { throw StoreFailure.invalidItem }
         switch item.status {
         case .active:
             guard item.completedAt == nil, item.abandonedAt == nil else { throw StoreFailure.invalidItem }
@@ -136,12 +138,12 @@ enum BackupCodec {
         encoder.outputFormatting = [.sortedKeys]
         let payload = try encoder.encode(archive)
         let checksum = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
-        return try encoder.encode(Envelope(formatVersion: 1, checksum: checksum, payload: payload))
+        return try encoder.encode(Envelope(formatVersion: archive.appVersion.compare("1.1.0", options: .numeric) == .orderedAscending ? 1 : 2, checksum: checksum, payload: payload))
     }
 
     static func decode(_ data: Data) throws -> StoreArchive {
         let envelope = try JSONDecoder().decode(Envelope.self, from: data)
-        guard envelope.formatVersion == 1 else { throw StoreFailure.unsupportedVersion }
+        guard [1, 2].contains(envelope.formatVersion) else { throw StoreFailure.unsupportedVersion }
         let checksum = SHA256.hash(data: envelope.payload).map { String(format: "%02x", $0) }.joined()
         guard checksum == envelope.checksum else { throw StoreFailure.invalidBackup }
         let archive = try JSONDecoder().decode(StoreArchive.self, from: envelope.payload)

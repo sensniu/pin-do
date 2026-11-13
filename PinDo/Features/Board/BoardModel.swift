@@ -3,6 +3,7 @@ import Foundation
 
 @MainActor
 final class BoardModel: ObservableObject {
+    @Published private(set) var scheduleIssues: Set<UUID> = []
     @Published private(set) var items: [TodoItem]
     @Published private(set) var layout: BoardLayout
     @Published private(set) var viewportBounds: CGRect = .zero
@@ -64,6 +65,7 @@ final class BoardModel: ObservableObject {
         self.persistence = persistence
         self.layout = BoardLayoutEngine().layout(items: items, now: date())
         self.viewportBounds = self.layout.bounds
+        refreshScheduleIssues()
     }
 
     var activeItems: [TodoItem] { items.filter { $0.status == .active } }
@@ -262,11 +264,15 @@ final class BoardModel: ObservableObject {
             errorMessage = StoreFailure.invalidProject.localizedDescription; return
         }
         let now = date()
+        let start = value.resolvedStart(at: now)
+        guard TodoSchedule(startAt: start, dueAt: value.hasDeadline ? value.dueAt : nil).isValid else {
+            errorMessage = "预计开始不能晚于截止时间，请修改安排或移除预计开始。"; return
+        }
         if value.isNew {
             let item = TodoItem(
                 id: value.id, title: value.title.trimmingCharacters(in: .whitespacesAndNewlines),
                 notes: value.notes, dueAt: value.hasDeadline ? value.dueAt : nil,
-                stars: value.stars, projectID: value.projectID, createdAt: now
+                stars: value.stars, projectID: value.projectID, createdAt: now, plannedStartAt: start
             )
             guard save(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true) else { return }
             initialLayoutPending = false
@@ -280,6 +286,7 @@ final class BoardModel: ObservableObject {
             item.title = value.title.trimmingCharacters(in: .whitespacesAndNewlines)
             item.notes = value.notes
             item.dueAt = value.hasDeadline ? value.dueAt : nil
+            item.plannedStartAt = start
             item.stars = min(3, max(1, value.stars))
             item.projectID = value.projectID
             if item == previous { cancelEditing(); return }
@@ -303,6 +310,7 @@ final class BoardModel: ObservableObject {
         var item = items[index]
         item.status = .completed
         item.completedAt = now
+        item.completionSchedule = CompletionSchedule(startAt: item.plannedStartAt, dueAt: item.dueAt)
         item.updatedAt = now
         let event = TodoEvent(itemID: id, kind: .completed, occurredAt: now)
         guard save(item, event: event, clearDraft: false) else { return }
@@ -328,6 +336,7 @@ final class BoardModel: ObservableObject {
         var item = items[index]
         item.status = .active
         item.completedAt = nil
+        item.completionSchedule = nil
         item.updatedAt = date()
         if let id = item.projectID, project(id)?.status != .active {
             item.projectID = nil
@@ -445,7 +454,17 @@ final class BoardModel: ObservableObject {
         layoutRevision += 1
     }
 
+    private func refreshScheduleIssues() {
+        guard let repository = persistence as? TodoRepository else { return }
+        do {
+            if let state = try repository.syncState() {
+                scheduleIssues = Set(try SyncGraph(state.changes).conflicts().filter { $0.field == "deadline" }
+                    .compactMap { UUID(uuidString: String($0.entity.dropFirst(5))) })
+            }
+        } catch { errorMessage = error.localizedDescription }
+    }
     private func refreshLayout() {
+        refreshScheduleIssues()
         layout = engine.refreshed(layout, items: visibleItems, now: date(), reserved: undoReservation, viewport: viewport)
     }
 }

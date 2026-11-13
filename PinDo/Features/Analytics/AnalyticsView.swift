@@ -155,10 +155,43 @@ struct AnalyticsView: View {
         DisclosureGroup("进一步看看", isExpanded: $model.moreAnalysis) {
             VStack(alignment: .leading, spacing: 16) {
                 if model.scope == .all { AnalyticsDistributionView(result: result, model: model, kind: .projects(.completed)) }
+                scheduleStatistics(result)
                 AnalyticsReviewView(result: result, selected: model.detail, select: model.select, content: .lifetime)
             }.padding(.top, 14)
         }.font(.callout)
         Button("本期放弃记录 · \(result.abandoned.count) 项") { model.select(.abandoned) }.buttonStyle(.link).font(.caption)
+    }
+
+    private func scheduleStatistics(_ result: AnalyticsResult) -> some View {
+        let stats = result.review.schedules
+        return GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("时间安排").font(.headline)
+                    Spacer()
+                    Button("查看样本 · \(stats.sampleIDs.count)项") { model.select(.scheduleSamples) }.buttonStyle(.link).font(.caption)
+                }
+                Text("计划开始至完成 · 含等待，不代表实际工时").font(.caption).foregroundStyle(.secondary)
+                HStack(alignment: .top, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("平均跨度").font(.caption).foregroundStyle(.secondary)
+                        Text(stats.averageSpan.map(AnalyticsReview.durationLabel) ?? "—")
+                    }
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("中位数").font(.caption).foregroundStyle(.secondary)
+                        Text(stats.medianSpan.map(AnalyticsReview.durationLabel) ?? "—")
+                    }
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("平均计划窗口").font(.caption).foregroundStyle(.secondary)
+                        Text(stats.averageWindow.map(AnalyticsReview.durationLabel) ?? "—")
+                    }
+                }.font(.callout).monospacedDigit()
+                Text("跨度\(stats.spans.count)项 · 计划窗口\(stats.windows.count)项 · 按时完成\(stats.onTime.count)/\(stats.deadlineSamples.count)项")
+                    .font(.caption).foregroundStyle(.secondary)
+                if !stats.early.isEmpty { Button("提前于预计开始完成 · \(stats.early.count)项") { model.select(.earlySchedule) }.buttonStyle(.link).font(.caption) }
+                Text("按完成时的安排统计；旧记录缺少的时间及待确认安排不补0。").font(.caption).foregroundStyle(.secondary)
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
+        }
     }
 
     private func importance(_ result: AnalyticsResult) -> some View {

@@ -235,6 +235,12 @@ final class TodoRepository: ProjectPersisting {
         let syncBefore = try syncContentsIfEnabled()
         var item = incoming
         var event = event
+        if event.kind == .completed {
+            if let state = try syncState(), try SyncGraph(state.changes).conflicts().contains(where: { $0.entity == SyncGraph.entity("todo", item.id) && $0.field == "deadline" }) {
+                throw SyncFailure.configuration("请先确认此待办的时间安排，再标记完成。")
+            }
+            item.completionSchedule = CompletionSchedule(startAt: item.plannedStartAt, dueAt: item.dueAt)
+        } else if event.kind == .completionUndone { item.completionSchedule = nil }
         try StoreArchive.validate(item)
         guard event.itemID == item.id else { throw StoreFailure.invalidItem }
         do {
@@ -247,10 +253,12 @@ final class TodoRepository: ProjectPersisting {
             } else {
                 guard let existing else { throw StoreFailure.staleItem }
                 prior = try JSONDecoder().decode(TodoItem.self, from: existing.payload)
+                if event.kind == .completed, prior?.schedule != incoming.schedule { throw StoreFailure.staleItem }
                 let required: TodoStatus = event.kind == .completionUndone ? .completed : .active
                 guard prior?.status == required || (event.kind == .edited && baseline != nil && syncBefore != nil) else { throw StoreFailure.staleItem }
                 if event.kind == .edited, baseline != nil, let prior {
                     item.status = prior.status; item.completedAt = prior.completedAt; item.abandonedAt = prior.abandonedAt
+                    item.completionSchedule = prior.completionSchedule
                     if let baseline {
                         // History describes this edit's actual intent, not stale values from untouched controls.
                         let changedDeadline = incoming.dueAt != baseline.item.dueAt

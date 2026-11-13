@@ -74,7 +74,7 @@ enum AnalyticsDetail: Hashable, Sendable {
     case record(UUID)
     case createdBucket(Date), completedBucket(Date)
     case project(AnalyticsProjectKey, AnalyticsProjectMode), age(AnalyticsAge)
-    case completionDay(Date), lifetime(AnalyticsLifetime), lifetimeIssues
+    case completionDay(Date), lifetime(AnalyticsLifetime), lifetimeIssues, scheduleSamples, earlySchedule
     case importance(Int?, AnalyticsImportanceSlice)
     case statusIssues, deadlineIssues, membershipIssues, timeIssues
 }
@@ -160,6 +160,7 @@ struct AnalyticsResult: Sendable {
         case .age(let age): ages.first { $0.age == age }?.items ?? []
         case .completionDay(let date): review.days.first { $0.date == date }?.items ?? []
         case .lifetime(let band): review.lifetimes.first { $0.band == band }?.items ?? []
+        case .scheduleSamples: review.schedules.sampleIDs; case .earlySchedule: review.schedules.early
         case .lifetimeIssues: review.lifetimeIssues
         case .importance(let stars, let slice): review.importance.first { $0.stars == stars }?.ids(slice) ?? []
         case .statusIssues: statusIssues; case .deadlineIssues: deadlineIssues; case .membershipIssues: membershipIssues; case .timeIssues: timeIssues
@@ -177,6 +178,7 @@ struct AnalyticsResult: Sendable {
         case .age(let age): "待办等待 · " + age.label
         case .completionDay(let date): dayLabel(date) + " · 完成"
         case .lifetime(let band): "创建到完成 · " + band.label
+        case .scheduleSamples: "本期完成时的安排"; case .earlySchedule: "提前于预计开始完成"
         case .lifetimeIssues: "创建与完成时间待核对"
         case .importance(let stars, let slice): (stars.map { "\($0)星" } ?? "星级待确认") + " · 当前" + slice.rawValue
         case .statusIssues: "状态待确认"; case .deadlineIssues: "截止时间待确认"

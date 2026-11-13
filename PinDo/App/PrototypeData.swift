@@ -9,8 +9,8 @@ enum PrototypeData {
     static func items(now: Date) -> [TodoItem] {
         let hour: TimeInterval = 3_600
         return [
-            TodoItem(title: "完成方案的最后一轮修改", notes: "梳理关键结论，再检查一次交付清单。", dueAt: now.addingTimeInterval(3 * hour), stars: 3, projectID: projects[0].id),
-            TodoItem(title: "整理本周的工作记录", notes: "记下做成的事，也留意还没有推进的部分。", dueAt: now.addingTimeInterval(18 * hour), stars: 2, projectID: projects[0].id),
+            TodoItem(title: "完成方案的最后一轮修改", notes: "梳理关键结论，再检查一次交付清单。", dueAt: now.addingTimeInterval(3 * hour), stars: 3, projectID: projects[0].id, plannedStartAt: now.addingTimeInterval(-3 * hour)),
+            TodoItem(title: "整理本周的工作记录", notes: "记下做成的事，也留意还没有推进的部分。", dueAt: now.addingTimeInterval(18 * hour), stars: 2, projectID: projects[0].id, plannedStartAt: now.addingTimeInterval(6 * hour)),
             TodoItem(title: "读完正在看的那一章", notes: "摘录一个值得继续想的问题。", dueAt: now.addingTimeInterval(48 * hour), projectID: projects[2].id),
             TodoItem(title: "预约年度体检", notes: "确认时间，避开下周的会议。", dueAt: now.addingTimeInterval(96 * hour), stars: 2, projectID: projects[1].id),
             TodoItem(title: "给家里添一盆绿植", notes: "找一种适合窗边、容易照顾的植物。", projectID: projects[1].id),

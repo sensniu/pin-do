@@ -307,3 +307,86 @@ final class BoardFlowTests: XCTestCase {
 
 }
 
+
+final class SchedulePersistenceTests: XCTestCase {
+    @MainActor
+    func testSaveCompleteUndoBackupAndReopenRetainScheduleWithoutHistoryFiles() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-schedule-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var repository: TodoRepository? = try TodoRepository(paths: AppPaths(root: root), appVersion: "1.1.0")
+        var board: BoardModel? = BoardModel(items: [], date: { now }, persistence: repository)
+        board!.beginNew()
+        var draft = try XCTUnwrap(board!.draft)
+        draft.title = "计划安排"; draft.hasDeadline = true; draft.dueAt = now.addingTimeInterval(3600)
+        draft.plannedStartAt = now.addingTimeInterval(-3600)
+        board!.submit(draft)
+        let id = draft.id
+        XCTAssertNil(board!.errorMessage)
+        XCTAssertEqual(try repository!.storedItem(id)?.plannedStartAt, draft.plannedStartAt)
+        let position = board!.layout.positions[id]
+        board!.complete(id)
+        XCTAssertEqual(try repository!.storedItem(id)?.completionSchedule?.startAt, draft.plannedStartAt)
+        board!.undoCompletion()
+        XCTAssertNil(try repository!.storedItem(id)?.completionSchedule)
+        XCTAssertEqual(board!.layout.positions[id], position)
+        board!.complete(id)
+        let bytes = try BackupCodec.encode(repository!.archive())
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+        XCTAssertEqual(envelope["formatVersion"] as? Int, 2)
+        let archive = try BackupCodec.decode(bytes)
+        XCTAssertEqual(try JSONDecoder().decode(TodoItem.self, from: XCTUnwrap(archive.records.first { $0.bucket == "todo-completed" }).payload).completionSchedule?.dueAt, draft.dueAt)
+        try await repository!.createAutomaticBackupNow()
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: repository!.paths.backups.path), ["recovery.latest.pindobackup"])
+        board!.retireAfterRestore(); board = nil; repository = nil
+        repository = try TodoRepository(paths: AppPaths(root: root), appVersion: "1.1.0")
+        XCTAssertEqual(try repository!.storedItem(id)?.plannedStartAt, draft.plannedStartAt)
+        XCTAssertEqual(try repository!.storedItem(id)?.completionSchedule?.dueAt, draft.dueAt)
+    }
+}
+
+extension SchedulePersistenceTests {
+    @MainActor
+    func testV10UpgradePreservesLegacyDraftIdentityAndPendingChangesWithoutInventingStart() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-v10-schedule-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let date = Date(timeIntervalSince1970: 1_800_000_000)
+        var old: TodoRepository? = try TodoRepository(paths: AppPaths(root: root), appVersion: "1.0.0")
+        let item = TodoItem(title: "升级前待办", notes: "保留原始备注", dueAt: date, createdAt: date)
+        try old!.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: date), clearDraft: true)
+        try old!.initializeSync()
+        let writer = try XCTUnwrap(old!.syncState()).writerID
+        let pending = try XCTUnwrap(old!.syncState()).pendingCount
+        let draft = NoteDraft(item: item, now: date)
+        try old!.saveDraft(draft)
+        old = nil
+        var current: TodoRepository? = try TodoRepository(paths: AppPaths(root: root), appVersion: "1.1.0")
+        XCTAssertEqual(try current!.storedItem(item.id), item)
+        XCTAssertEqual(try current!.loadDraft(), draft)
+        XCTAssertNil(try current!.storedItem(item.id)?.plannedStartAt)
+        XCTAssertEqual(try current!.syncState()?.writerID, writer)
+        XCTAssertEqual(try current!.syncState()?.pendingCount, pending)
+        _ = try BackupCodec.decode(BackupCodec.encode(current!.archive()))
+        current = nil
+        XCTAssertThrowsError(try TodoRepository(paths: AppPaths(root: root), appVersion: "1.0.0"))
+    }
+}
+
+extension SchedulePersistenceTests {
+    @MainActor
+    func testCompletionRejectsStaleScheduleWithoutOverwritingTheNewPlan() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-stale-schedule-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let repository = try TodoRepository(paths: AppPaths(root: root), appVersion: "1.1.0")
+        var item = TodoItem(title: "完成时保持新安排", dueAt: now.addingTimeInterval(3600), createdAt: now, plannedStartAt: now)
+        try repository.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        var stale = item; stale.status = .completed; stale.completedAt = now
+        item.dueAt = now.addingTimeInterval(7200)
+        try repository.commit(item, event: TodoEvent(itemID: item.id, kind: .edited, occurredAt: now), clearDraft: true)
+        XCTAssertThrowsError(try repository.commit(stale, event: TodoEvent(itemID: item.id, kind: .completed, occurredAt: now), clearDraft: true))
+        XCTAssertEqual(try repository.storedItem(item.id)?.status, .active)
+        XCTAssertEqual(try repository.storedItem(item.id)?.dueAt, item.dueAt)
+        XCTAssertNil(try repository.storedItem(item.id)?.completionSchedule)
+    }
+}

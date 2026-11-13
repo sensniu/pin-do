@@ -60,6 +60,7 @@ struct AnalyticsReview: Sendable {
     let lifetimeIssues: [UUID]
     let medianLifetime: TimeInterval?
     let importance: [AnalyticsImportanceGroup]
+    let schedules: ScheduleStatistics
 
     static func calculate(completed: [TodoItem], active: [TodoItem], issues: [UUID: Set<String>],
                           overdue: [UUID], interval: DateInterval, now: Date, calendar: Calendar) throws -> Self {
@@ -105,7 +106,7 @@ struct AnalyticsReview: Sendable {
         // Fixed levels retain the same meaning across dates and project scopes. Last band is 7+.
         let thresholds = [1, 3, 6, Int.max]
         return Self(days: days, heatmapThresholds: thresholds, lifetimes: lifetimes, durations: durations, lifetimeIssues: invalid,
-                    medianLifetime: median, importance: importance)
+                    medianLifetime: median, importance: importance, schedules: ScheduleStatistics(completed: completed, issues: issues))
     }
 
     static func durationLabel(_ seconds: TimeInterval) -> String {
@@ -115,5 +116,42 @@ struct AnalyticsReview: Sendable {
         if seconds < 3600 { return "\(Int(seconds / 60))分钟" }
         let value = seconds < 86400 ? seconds / 3600 : seconds / 86400
         return value.formatted(.number.precision(.fractionLength(0...1))) + (seconds < 86400 ? "小时" : "天")
+    }
+}
+
+
+struct ScheduleStatistics: Sendable {
+    var windows: [UUID: TimeInterval] = [:]
+    var spans: [UUID: TimeInterval] = [:]
+    var early: [UUID] = []
+    var deadlineSamples: [UUID] = []
+    var onTime: [UUID] = []
+    var sampleIDs: [UUID] { Array(Set(windows.keys).union(spans.keys).union(deadlineSamples)).sorted { $0.uuidString < $1.uuidString } }
+    var averageWindow: TimeInterval? { Self.mean(Array(windows.values)) }
+    var averageSpan: TimeInterval? { Self.mean(Array(spans.values)) }
+    var medianSpan: TimeInterval? {
+        let sorted = spans.values.sorted(), middle = sorted.count / 2
+        guard !sorted.isEmpty else { return nil }
+        return sorted.count.isMultiple(of: 2) ? sorted[middle - 1] / 2 + sorted[middle] / 2 : sorted[middle]
+    }
+    private static func mean(_ values: [Double]) -> Double? {
+        values.isEmpty ? nil : values.reduce(0) { $0 + $1 / Double(values.count) }
+    }
+    init(completed: [TodoItem], issues: [UUID: Set<String>]) {
+        for item in completed {
+            guard item.status == .completed, issues[item.id, default: []].isDisjoint(with: ["deadline", "lifecycle"]),
+                  let end = item.completedAt, end.timeIntervalSince1970.isFinite,
+                  let snapshot = item.completionSchedule, snapshot.schedule.isValid else { continue }
+            if let due = snapshot.dueAt {
+                deadlineSamples.append(item.id)
+                if end <= due { onTime.append(item.id) }
+                if let start = snapshot.startAt {
+                    let window = due.timeIntervalSince(start), span = end.timeIntervalSince(start)
+                    if window.isFinite { windows[item.id] = window }
+                    if span.isFinite, span >= 0 { spans[item.id] = span }
+                    else if span < 0 { early.append(item.id) }
+                }
+            }
+        }
     }
 }

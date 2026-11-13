@@ -87,6 +87,7 @@ struct SyncAssignment: Codable, Equatable, Sendable, Identifiable {
 struct SyncLife: Codable, Equatable, Sendable {
     let status: String
     let date: Date?
+    var completionSchedule: CompletionSchedule? = nil
     var generation: SyncGeneration? = nil
     var retired: [String: Int]? = nil
     var transition: SyncGeneration? = nil
@@ -118,7 +119,7 @@ struct SyncPacket: Codable, Sendable {
     let previous: String
     let changes: [SyncChange]
 }
-struct SyncLibrary: Codable, Sendable { var version = 3; let id: UUID }
+struct SyncLibrary: Codable, Sendable { var version = 4; let id: UUID }
 struct SyncHead: Codable, Sendable {
     var version = 1
     let libraryID: UUID
@@ -131,7 +132,7 @@ struct SyncConflict: Identifiable, Sendable {
     let candidates: [SyncWrite]
     var id: String { entity + "/" + field }
     var fieldLabel: String {
-        ["title": "标题", "notes": "备注", "deadline": "截止时间", "stars": "重要程度", "membership": "项目归属", "lifecycle": "状态", "name": "项目名称", "color": "项目颜色", "identity": "来源身份"][field] ?? field
+        ["title": "标题", "notes": "备注", "deadline": "时间安排", "stars": "重要程度", "membership": "项目归属", "lifecycle": "状态", "name": "项目名称", "color": "项目颜色", "identity": "来源身份"][field] ?? field
     }
 }
 struct SyncState: Codable, Sendable {
