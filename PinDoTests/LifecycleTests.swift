@@ -3,6 +3,38 @@ import AppKit
 import Carbon
 
 final class LifecycleTests: XCTestCase {
+    func testDefaultWindowTracksAvailableScreenAndOccupiesAboutTwoThirds() {
+        for visible in [CGRect(x:0,y:40,width:1512,height:900),CGRect(x:-2560,y:80,width:2560,height:1360)] {
+            let frame = WindowSizing.frame(visible:visible,restored:nil,minimum:CGSize(width:760,height:582),upgrade:false)
+            XCTAssertEqual(frame.width,visible.width*0.82,accuracy:0.001)
+            XCTAssertEqual(frame.height,visible.height*0.82,accuracy:0.001)
+            XCTAssertEqual(frame.midX,visible.midX,accuracy:0.001); XCTAssertEqual(frame.midY,visible.midY,accuracy:0.001)
+            XCTAssertTrue(visible.contains(frame)); XCTAssertLessThan(frame.width*frame.height/(visible.width*visible.height),0.70)
+        }
+    }
+    func testWindowSizingUpgradeEnlargesOnlyUndersizedDimensionsOnce() {
+        let visible = CGRect(x:0,y:50,width:1800,height:1100), old = CGRect(x:40,y:100,width:1550,height:600)
+        let new = WindowSizing.frame(visible:visible,restored:old,minimum:CGSize(width:760,height:582),upgrade:true)
+        XCTAssertEqual(new.width,1550); XCTAssertEqual(new.height,902,accuracy:0.001)
+        let manual = CGRect(x:0,y:50,width:900,height:650)
+        XCTAssertEqual(WindowSizing.frame(visible:visible,restored:manual,minimum:CGSize(width:760,height:582),upgrade:false),manual)
+    }
+    func testDisconnectedScreenAndOversizedWindowAreClampedToCurrentScreen() {
+        let visible = CGRect(x:100,y:40,width:1200,height:760)
+        let frame = WindowSizing.frame(visible:visible,restored:CGRect(x:-3000,y:2000,width:2500,height:1800),minimum:CGSize(width:760,height:582),upgrade:false)
+        XCTAssertTrue(visible.contains(frame)); XCTAssertEqual(frame.size,visible.size)
+    }
+    func testUpgradeDoesNotShrinkAnAlreadyLargeValidCustomWindow() {
+        let visible = CGRect(x:0,y:40,width:1600,height:1000)
+        let custom = CGRect(x:5,y:45,width:1590,height:990)
+        XCTAssertEqual(WindowSizing.frame(visible:visible,restored:custom,minimum:CGSize(width:760,height:582),upgrade:true),custom)
+    }
+    func testSmallScreensStillContainDefaultFrameWithDesktopMargin() {
+        let visible = CGRect(x:0,y:24,width:900,height:650)
+        let frame = WindowSizing.frame(visible:visible,restored:nil,minimum:CGSize(width:760,height:582),upgrade:false)
+        XCTAssertTrue(visible.contains(frame)); XCTAssertGreaterThan(frame.minX,visible.minX)
+        XCTAssertGreaterThan(frame.minY,visible.minY)
+    }
     @MainActor
     private func qEvent(_ type: NSEvent.EventType, time: TimeInterval) -> NSEvent {
         NSEvent.keyEvent(with: type, location: .zero, modifierFlags: .command, timestamp: time,

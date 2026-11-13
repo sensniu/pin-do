@@ -13,15 +13,15 @@ struct ProjectTabBarView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
             tab("全部待办", scope: .all)
             tab("未分配项目", scope: .unassigned)
-            Divider().frame(height: 22).padding(.horizontal, 2)
+            Divider().frame(height: 18).padding(.horizontal, 2)
             GeometryReader { geometry in
                 ScrollViewReader { reader in
                     HStack(spacing: 3) {
                         ScrollView(.horizontal) {
-                            HStack(spacing: 6) {
+                            HStack(spacing: 4) {
                                 ForEach(model.activeProjects) { project in
                                     tab(model.projectLabel(project), scope: .project(project.id), project: project)
                                         .id(BoardScope.project(project.id))
@@ -32,14 +32,14 @@ struct ProjectTabBarView: View {
                                         })
                                 }
                             }
-                            .padding(.horizontal, 2).padding(.vertical, 4)
+                            .padding(.horizontal, 2).padding(.vertical, 2)
                             .background(GeometryReader { content in
                                 Color.clear.onAppear { scroll.contentWidth = content.size.width }
                                     .onChange(of: content.size.width) { _, width in scroll.contentWidth = width }
                             })
                         }
                         .coordinateSpace(name: "project-tabs")
-                        .scrollIndicators(.visible)
+                        .scrollIndicators(.hidden)
                         if scroll.contentWidth > geometry.size.width {
                             arrow("chevron.left", delta: -1, reader: reader)
                             arrow("chevron.right", delta: 1, reader: reader)
@@ -50,9 +50,9 @@ struct ProjectTabBarView: View {
                     .onChange(of: model.projects.map { $0.name }) { _, _ in reveal(reader) }
                     .onAppear { reveal(reader) }
                 }
-            }.frame(height: 42)
+            }.frame(height: 32)
         }
-        .padding(.horizontal, 24).padding(.top, 4).padding(.bottom, 2)
+        .padding(.horizontal, 20).padding(.vertical, 2)
         .accessibilityElement(children: .contain).accessibilityLabel("白板标签栏")
     }
 
@@ -65,7 +65,7 @@ struct ProjectTabBarView: View {
             withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
                 reader.scrollTo(BoardScope.project(projects[next].id), anchor: .leading)
             }
-        } label: { Image(systemName: symbol).font(.system(size: 10, weight: .semibold)).frame(width: 22, height: 30) }
+        } label: { Image(systemName: symbol).font(.system(size: 10, weight: .semibold)).frame(width: 22, height: 28) }
             .buttonStyle(.plain).help(delta < 0 ? "向左浏览项目" : "向右浏览项目")
             .accessibilityLabel(delta < 0 ? "向左浏览项目" : "向右浏览项目")
     }
@@ -74,7 +74,8 @@ struct ProjectTabBarView: View {
         guard model.selectedScope.projectID != nil else { return }
         Task { @MainActor in
             await Task.yield()
-            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) { reader.scrollTo(model.selectedScope, anchor: .center) }
+            // No explicit anchor: move only enough to reveal the resized selected tab.
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) { reader.scrollTo(model.selectedScope) }
         }
     }
 
@@ -85,10 +86,10 @@ struct ProjectTabBarView: View {
         let ink: Color = project.map { $0.colorValue.usesWhiteInk ? .white : .black } ?? (scheme == .dark ? .white : .black)
         return Button { model.selectScope(scope) } label: {
             HStack(spacing: 5) {
-                Image(systemName: "checkmark").font(.system(size: 9, weight: .bold)).opacity(selected ? 1 : 0)
+                if selected { Image(systemName: "checkmark").font(.system(size: 9, weight: .bold)) }
                 Text(title).font(.system(size: 12, weight: selected ? .semibold : .regular)).fixedSize(horizontal: true, vertical: false)
             }
-            .padding(.horizontal, 9).frame(height: 30).foregroundStyle(ink)
+            .padding(.horizontal, 7).frame(height: 26).foregroundStyle(ink)
             .background(fill, in: RoundedRectangle(cornerRadius: 8))
             .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(ink.opacity(selected ? 0.9 : 0.15), lineWidth: selected ? 1.5 : 0.5) }
             .padding(1).contentShape(Rectangle())

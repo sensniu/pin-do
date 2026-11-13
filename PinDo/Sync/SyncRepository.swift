@@ -86,7 +86,7 @@ extension TodoRepository {
         try appendCurrent(change, to: &state)
         do { try applyProjection(state); try putSyncState(state); try context.save() }
         catch { context.rollback(); throw error }
-        scheduleBackup(); onBusinessChange?()
+        scheduleBackup(); contentsChanged()
         return try project(baseline.project.id)
     }
     func initializeSync() throws {
@@ -183,7 +183,7 @@ extension TodoRepository {
         try appendCurrent(change, to: &state)
         do { try applyProjection(state); try putSyncState(state); try context.save() }
         catch { context.rollback(); throw error }
-        scheduleBackup(); onBusinessChange?()
+        scheduleBackup(); contentsChanged()
     }
     func mergeSyncBackup(_ archive: StoreArchive) throws {
         guard var state = try syncState() else { throw SyncFailure.invalidData }
@@ -220,7 +220,7 @@ extension TodoRepository {
         for change in imported { try appendCurrent(change, to: &state) }
         do { try applyProjection(state); try putSyncState(state); try context.save() }
         catch { context.rollback(); throw error }
-        scheduleBackup(); onBusinessChange?()
+        scheduleBackup(); contentsChanged()
     }
 
     private func applyProjection(_ state: SyncState) throws {

@@ -37,8 +37,8 @@ final class SyncCoordinator: ObservableObject {
     @Published private(set) var error: String?
     @Published private(set) var conflicts: [SyncConflict] = []
     @Published private(set) var retainedItems: [TodoItem] = []
-    @Published var showingSettings = false
-    @Published var showingConflicts = false
+    var showSettings: ((Bool) -> Void)?
+    private var maintenance = false
     private(set) var repository: TodoRepository?
     private let credentials: any SyncCredentials
     private var scheduled: Task<Void, Never>?
@@ -68,6 +68,28 @@ final class SyncCoordinator: ObservableObject {
     var configuration: SyncConnection? { try? repository?.syncState()?.connection }
     var enabled: Bool { (try? repository?.syncState()?.enabled) == true }
     var lastSuccess: Date? { try? repository?.syncState()?.lastSuccess }
+    var isBound: Bool { (try? repository?.syncState()?.libraryID) != nil }
+    var primaryActionTitle: String {
+        configuration == nil ? "设置同步" : !enabled ? "恢复同步" : error == nil ? "立即同步" : "重试同步"
+    }
+    func performPrimaryAction() {
+        if configuration == nil { showSettings?(false) }
+        else if !enabled { resume() }
+        else { requestSync() }
+    }
+    func resume() {
+        guard !busy, !maintenance, configuration != nil, let repository else { return }
+        do {
+            guard var state = try repository.syncState() else { return }
+            state.enabled = true; try repository.saveSyncState(state); refreshStatus(); requestSync()
+        } catch { self.error = error.localizedDescription }
+    }
+    func beginMaintenance() -> Bool {
+        guard !busy, !maintenance else { return false }
+        maintenance = true; scheduled?.cancel(); return true
+    }
+    func endMaintenance() { maintenance = false; requestSync() }
+    func noteConnectionError(_ error: Error) { self.error = error.localizedDescription }
     func refreshStatus() {
         do {
             guard let state = try repository?.syncState() else { message = "未启用同步"; return }
@@ -99,7 +121,7 @@ final class SyncCoordinator: ObservableObject {
         }
     }
     func requestSync() {
-        guard enabled else { return }
+        guard enabled, !maintenance else { return }
         if busy { rerun = true; return }
         if let retryNotBefore, retryNotBefore > .now { schedule(after: retryNotBefore.timeIntervalSinceNow); return }
         scheduled?.cancel(); firstPending = nil
@@ -114,7 +136,7 @@ final class SyncCoordinator: ObservableObject {
     }
     /// User explicitly selects a directory and connects/merges. No account-wide discovery.
     func connect(_ connection: SyncConnection, password: String) async throws {
-        guard !busy, let repository else { throw SyncFailure.configuration("请等待当前同步完成。") }
+        guard !busy, !maintenance, let repository else { throw SyncFailure.configuration("请等待当前同步或数据操作完成。") }
         _ = try connection.root
         let previous = try repository.syncState()
         if let old = previous, old.libraryID != nil, old.connection != connection {
@@ -138,7 +160,7 @@ final class SyncCoordinator: ObservableObject {
         schedule(after: 0.2)
     }
     private func run() async {
-        guard enabled, !busy, let connection = configuration else { return }
+        guard enabled, !busy, !maintenance, let connection = configuration else { return }
         busy = true; rerun = false; error = nil; message = "正在同步…"
         do {
             let password = try credentials.password(for: connection.credentialKey) ?? ""

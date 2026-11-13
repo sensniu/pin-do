@@ -9,6 +9,7 @@
 # Applications, installers, archives and debug symbols
 *.app/
 *.dmg
+*.dmg.sha256
 *.pkg
 *.xcarchive/
 *.dSYM/
@@ -16,7 +17,14 @@
 # Logs
 *.log
 *.log.*
-logs/
+[Ll]ogs/
+
+# Local Codex project notes and design drafts
+/PROJECT_PLAN.md
+/AGENTS.md
+/.agents/
+/.codex/
+/asset/menu-bar-proposals/
 
 # Local databases and exported user backups
 *.store

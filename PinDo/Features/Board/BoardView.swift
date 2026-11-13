@@ -1,9 +1,9 @@
 import SwiftUI
 
 struct BoardView: View {
-    @EnvironmentObject private var sync: SyncCoordinator
+    var isActive = true
     @ObservedObject var model: BoardModel
-    @StateObject private var clock = BoardClock()
+    @ObservedObject var clock: BoardClock
     @StateObject private var session = BoardSession()
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -14,7 +14,6 @@ struct BoardView: View {
     var body: some View {
         GeometryReader { window in
             VStack(spacing: 0) {
-                header.padding(.horizontal, 26).padding(.top, 10).padding(.bottom, 4)
                 GeometryReader { geometry in
                     let scale = currentScale(size: geometry.size)
                     ZStack {
@@ -72,7 +71,7 @@ struct BoardView: View {
                     .coordinateSpace(name: "board-canvas")
                     .contentShape(Rectangle())
                     .background {
-                        if model.draft == nil {
+                        if isActive && model.draft == nil {
                             BoardGestureBridge { delta in
                                 guard session.noteDragID == nil else { return }
                                 session.pan.width += delta.width
@@ -93,6 +92,7 @@ struct BoardView: View {
                     .overlay(alignment: .bottomTrailing) { zoomControls(scale: scale).padding(16) }
                     .onAppear { model.updateViewport(geometry.size) }
                     .onChange(of: geometry.size) { _, size in model.updateViewport(size) }
+                    .onChange(of: model.zoomRevision) { _, _ in session.manualScale = clamped(scale * model.zoomFactor) }
                 }
             }
             .background(boardColor)
@@ -100,41 +100,13 @@ struct BoardView: View {
 
         }
         .frame(minWidth: 480, minHeight: 360)
-        .onAppear { clock.start(items: model.visibleItems) }
+        .onAppear { if isActive { clock.start(items: model.visibleItems) } }
+        .onChange(of: isActive) { _, active in if active { clock.start(items: model.visibleItems) } else { clock.stop() } }
         .onDisappear { clock.stop(); model.flushDraft() }
         .onChange(of: clock.now) { _, _ in clock.update(items: model.visibleItems) }
-        .onChange(of: model.items) { _, _ in clock.start(items: model.visibleItems) }
-        .onChange(of: model.layoutRevision) { _, _ in resetViewport(); clock.start(items: model.visibleItems) }
+        .onChange(of: model.items) { _, _ in if isActive { clock.start(items: model.visibleItems) } }
+        .onChange(of: model.layoutRevision) { _, _ in resetViewport(); if isActive { clock.start(items: model.visibleItems) } }
         .onChange(of: model.fitRevision) { _, _ in withAnimation(animation) { resetViewport() } }
-    }
-
-    private var header: some View {
-        HStack(spacing: 12) {
-            Text(model.boardTitle).font(.system(size: 17, weight: .semibold))
-                .lineLimit(1).help(model.boardTitle)
-            let overdue = model.visibleItems.filter { UrgencyPolicy().evaluate(dueAt: $0.dueAt, now: clock.now).isOverdue }.count
-            Text("\(model.visibleItems.count) 项" + (overdue > 0 ? " · \(overdue) 项已逾期" : ""))
-                .font(.system(size: 12)).foregroundStyle(.secondary).fixedSize()
-            Spacer(minLength: 8)
-            Button { withAnimation(animation) { model.reorderBoard() } } label: {
-                Image(systemName: "square.grid.3x3").font(.system(size: 15))
-                    .frame(width: 30, height: 30).contentShape(Rectangle())
-            }.buttonStyle(.plain).help("重新整理当前白板（覆盖手动位置）")
-                .accessibilityLabel("重新整理白板").accessibilityIdentifier("reorder-board")
-            SyncRefreshButton(sync: sync)
-            if let receipt = model.undo {
-                Text("已完成").font(.system(size: 12)).foregroundStyle(.secondary)
-                UndoCountdownView(receipt: receipt) {
-                    withAnimation(animation) { model.undoCompletion() }
-                }.id(receipt.id)
-            }
-            Button { withAnimation(animation) { model.beginNew() } } label: {
-                Image(systemName: "plus").font(.system(size: 17, weight: .medium))
-                    .frame(width: 34, height: 34)
-                    .background(.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-            }.buttonStyle(.plain).help("新增待办 ⌘N")
-                .accessibilityLabel("新增待办").accessibilityIdentifier("new-todo")
-        }.frame(height: 42)
     }
 
     private var emptyTitle: String {

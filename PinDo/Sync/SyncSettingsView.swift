@@ -9,91 +9,48 @@ final class SyncSettingsDraft: ObservableObject {
     @Published var password = ""
     @Published var error: String?
     @Published var connecting = false
+    @Published var connectionExpanded = false
+    @Published var issuesExpanded = false
+    private var original: SyncConnection
     init(_ connection: SyncConnection?) {
-        server = connection?.server ?? "https://dav.jianguoyun.com/dav/"
-        directory = connection?.directory ?? ""
-        username = connection?.username ?? ""
+        let value = connection ?? SyncConnection(server: "https://dav.jianguoyun.com/dav/", directory: "", username: "")
+        original = value; server = value.server; directory = value.directory; username = value.username
     }
     var connection: SyncConnection { SyncConnection(server: server, directory: directory, username: username) }
     var valid: Bool { (try? connection.root) != nil }
-}
-
-struct SyncSettingsView: View {
-    @ObservedObject var sync: SyncCoordinator
-    @StateObject private var draft: SyncSettingsDraft
-    @Environment(\.dismiss) private var dismiss
-    init(sync: SyncCoordinator) {
-        self.sync = sync
-        _draft = StateObject(wrappedValue: SyncSettingsDraft(sync.configuration))
-    }
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("WebDAV 同步").font(.title2.weight(.semibold))
-            Text("连接后，更改会自动同步。离线时先保存在本机，也可以随时点击白板上的刷新按钮。")
-                .font(.callout).foregroundStyle(.secondary)
-            Form {
-                TextField("服务器地址", text: $draft.server)
-                TextField("同步目录（必填）", text: $draft.directory, prompt: Text("例如 PinDo，需手动填写"))
-                TextField("账号", text: $draft.username)
-                SecureField(sync.configuration == nil ? "应用授权密码" : "新密码（留空保留原密码）", text: $draft.password)
-            }.textFieldStyle(.roundedBorder)
-            Text("使用专用目录；多台设备填写同一个目录。首次连接会按层级创建缺失文件夹，并初始化同步信息。连接已有同步库时会合并数据，不会用本机数据覆盖整个目录。")
-                .font(.caption).foregroundStyle(.secondary)
-            HStack {
-                Image(systemName: sync.enabled ? "arrow.triangle.2.circlepath" : "pause.circle")
-                Text(sync.message)
-                Spacer()
-                if let date = sync.lastSuccess { Text(date.formatted(date: .abbreviated, time: .shortened)).foregroundStyle(.secondary) }
-            }.font(.callout)
-            if let error = draft.error ?? sync.error { Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled) }
-            Divider()
-            HStack {
-                if sync.enabled { Button("暂停自动同步") { sync.pause() }.disabled(sync.busy) }
-                if !sync.conflicts.isEmpty {
-                    Button("处理冲突（\(sync.conflicts.count)）") { dismiss(); sync.showingConflicts = true }
-                }
-                Spacer()
-                Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction).disabled(draft.connecting)
-                Button(draft.connecting ? "正在连接…" : "连接并合并") {
-                    draft.connecting = true; draft.error = nil
-                    Task {
-                        do { try await sync.connect(draft.connection, password: draft.password); draft.password = "" }
-                        catch { draft.error = error.localizedDescription }
-                        draft.connecting = false
-                    }
-                }.keyboardShortcut(.defaultAction).disabled(!draft.valid || draft.connecting || sync.busy)
-            }
-        }.padding(24).frame(width: 550)
-    }
+    var changed: Bool { connection != original || !password.isEmpty }
+    func reset() { server = original.server; directory = original.directory; username = original.username; password = ""; error = nil }
+    func accept() { original = connection; password = "" }
 }
 
 struct SyncRefreshButton: View {
     @ObservedObject var sync: SyncCoordinator
     var body: some View {
-        Button {
-            if !sync.enabled { sync.showingSettings = true }
-            else { sync.requestSync() }
-        } label: {
-            HStack(spacing: 4) {
-                if sync.busy { ProgressView().controlSize(.small).frame(width: 18, height: 18) }
-                else { Image(systemName: sync.error == nil ? "arrow.clockwise" : "exclamationmark.arrow.triangle.2.circlepath").font(.system(size: 15)) }
-                if !sync.conflicts.isEmpty { Text("\(sync.conflicts.count)").font(.caption) }
-            }.frame(minWidth: 30, minHeight: 30).contentShape(Rectangle())
-        }.buttonStyle(.plain).disabled(sync.busy)
-            .help(sync.error ?? (sync.message + " · 点击同步，右键设置"))
-            .accessibilityLabel("同步：" + sync.message)
-            .contextMenu {
-                Button("立即同步") { sync.requestSync() }.disabled(!sync.enabled || sync.busy)
-                Button("同步设置…") { sync.showingSettings = true }
-                Button("处理冲突…") { sync.showingConflicts = true }.disabled(sync.conflicts.isEmpty)
-            }
+        HStack(spacing: 2) {
+            Button { sync.performPrimaryAction() } label: {
+                if sync.busy { ProgressView().controlSize(.small).frame(width: 28, height: 30) }
+                else { Image(systemName: sync.configuration == nil ? "cloud" : !sync.enabled ? "play.circle" : sync.error == nil ? "arrow.clockwise" : "exclamationmark.arrow.triangle.2.circlepath")
+                    .font(.system(size: 15)).frame(width: 28, height: 30).contentShape(Rectangle()) }
+            }.buttonStyle(.plain).disabled(sync.busy).help(sync.primaryActionTitle).accessibilityLabel(sync.primaryActionTitle)
+            Menu {
+                Button(sync.primaryActionTitle) { sync.performPrimaryAction() }.disabled(sync.busy)
+                Button("同步状态…") { sync.showSettings?(false) }
+                if !sync.conflicts.isEmpty { Button("处理冲突（\(sync.conflicts.count)）…") { sync.showSettings?(true) } }
+                if sync.error != nil { Button("查看同步问题…") { sync.showSettings?(true) } }
+                if sync.enabled { Divider(); Button("暂停同步") { sync.pause() }.disabled(sync.busy) }
+            } label: {
+                HStack(spacing: 2) {
+                    if !sync.conflicts.isEmpty { Text("\(sync.conflicts.count)").font(.caption) }
+                    Image(systemName: "chevron.down").font(.system(size: 9)).frame(width: 14, height: 30)
+                }
+            }.menuStyle(.borderlessButton).fixedSize().help("同步状态与设置").accessibilityLabel("同步状态与设置")
+        }
     }
 }
 
 struct SyncConflictsView: View {
     @ObservedObject var sync: SyncCoordinator
-    @Environment(\.dismiss) private var dismiss
-    var body: some View {
+        var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("同步冲突").font(.title2.weight(.semibold))
             Text("不同设备修改了同一内容。未解决的候选会保留；采用某个版本后，已解决的旧候选会清理。")
@@ -124,20 +81,8 @@ struct SyncConflictsView: View {
                         }
                     }
                 }
-            }.frame(minHeight: 240, maxHeight: 440)
+            }.frame(minHeight: 180, maxHeight: 330)
             if let error = sync.error { Text(error).foregroundStyle(.red).font(.caption) }
-            HStack { Spacer(); Button("完成") { dismiss() }.keyboardShortcut(.cancelAction) }
-        }.padding(24).frame(width: 640)
-    }
-}
-
-struct SyncMenuItems: View {
-    @ObservedObject var sync: SyncCoordinator
-    var body: some View {
-        Group {
-            Button("立即同步") { sync.requestSync() }.disabled(!sync.enabled || sync.busy)
-            Button("WebDAV 同步设置…") { sync.showingSettings = true }
-            Button("处理同步冲突…") { sync.showingConflicts = true }
         }
     }
 }

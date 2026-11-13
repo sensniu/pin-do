@@ -110,4 +110,49 @@ final class MigrationTests: XCTestCase {
         broken.formatVersion = 1
         XCTAssertThrowsError(try broken.upgraded())
     }
+
+    @MainActor func testVersionOneUpgradePreservesBusinessRecordsDraftAndPendingSync() throws {
+        let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+        let paths = AppPaths(root: root)
+        var store: TodoRepository? = try TodoRepository(paths: paths, appVersion: "0.13.0")
+        let project = try store!.createProject(name: "升级保留项目")
+        let time = Date(timeIntervalSince1970: 1_790_000_000)
+        let active = TodoItem(title: "待办保留", notes: "完整备注", dueAt: time.addingTimeInterval(3600), stars: 3, projectID: project.id, createdAt: time)
+        var completed = TodoItem(title: "完成保留", projectID: project.id, createdAt: time)
+        var abandoned = TodoItem(title: "放弃保留", projectID: project.id, createdAt: time)
+        for item in [active, completed, abandoned] {
+            try store!.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: time), clearDraft: true)
+        }
+        completed.status = .completed; completed.completedAt = time.addingTimeInterval(120)
+        abandoned.status = .abandoned; abandoned.abandonedAt = time.addingTimeInterval(180)
+        try store!.commit(completed, event: TodoEvent(itemID: completed.id, kind: .completed, occurredAt: completed.completedAt!), clearDraft: true)
+        try store!.commit(abandoned, event: TodoEvent(itemID: abandoned.id, kind: .abandoned, occurredAt: abandoned.abandonedAt!), clearDraft: true)
+        try store!.initializeSync()
+        var sync = try XCTUnwrap(store!.syncState()); sync.enabled = false
+        try store!.saveSyncState(sync)
+        let expectedItems = try [active.id, completed.id, abandoned.id].map { try XCTUnwrap(store!.storedItem($0)) }
+        var draft = NoteDraft(item: expectedItems[0], now: time); draft.notes = "尚未提交的草稿"
+        try store!.saveDraft(draft)
+        let expectedProjects = try store!.loadProjects()
+        let before = try JSONDecoder().decode(StoreManifest.self, from: Data(contentsOf: paths.manifest))
+        XCTAssertGreaterThan(sync.pendingCount, 0)
+        store = nil
+
+        store = try TodoRepository(paths: paths, appVersion: "1.0.0")
+        for item in expectedItems { XCTAssertEqual(try store!.storedItem(item.id), item) }
+        XCTAssertEqual(try store!.loadProjects(), expectedProjects)
+        XCTAssertEqual(try store!.loadDraft(), draft)
+        let restored = try XCTUnwrap(store!.syncState())
+        XCTAssertEqual(restored.writerID, sync.writerID)
+        XCTAssertEqual(restored.pendingCount, sync.pendingCount)
+        XCTAssertEqual(restored.current?.protocolVersion, 3)
+        XCTAssertFalse(restored.enabled)
+        let after = try JSONDecoder().decode(StoreManifest.self, from: Data(contentsOf: paths.manifest))
+        XCTAssertEqual(after.storeID, before.storeID)
+        XCTAssertEqual(after.formatVersion, before.formatVersion)
+        XCTAssertEqual(after.lastAppVersion, "1.0.0")
+        try store!.archive().validate()
+        store = nil
+        XCTAssertThrowsError(try TodoRepository(paths: paths, appVersion: "0.13.0"))
+    }
 }

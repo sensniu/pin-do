@@ -39,11 +39,14 @@ final class TodoRepository: ProjectPersisting {
     private let container: ModelContainer
     let context: ModelContext
     private let backupService: Task<BackupService, Never>
+    private let analyticsReader: AnalyticsReader
     private let prepared: PreparedStore
     private let appVersion: String
     private var backupTask: Task<Void, Never>?
     var onBusinessChange: (() -> Void)?
+    var onContentsChange: (() -> Void)?
     var onBackupFailure: ((String) -> Void)?
+    var onBackupSuccess: (() -> Void)?
 
     convenience init(paths: AppPaths, appVersion: String) throws {
         try self.init(paths: paths, appVersion: appVersion, prepared: Self.prepareForOpening(paths: paths, appVersion: appVersion))
@@ -56,7 +59,11 @@ final class TodoRepository: ProjectPersisting {
         self.container = container; self.context = ModelContext(container)
         self.context.autosaveEnabled = false
         self.backupService = Task.detached(priority: .utility) { BackupService(container: container) }
+        self.analyticsReader = AnalyticsReader(container: container)
     }
+
+    func analyticsInput() async throws -> AnalyticsInput { try await analyticsReader.read() }
+    func contentsChanged() { onContentsChange?(); onBusinessChange?() }
 
     nonisolated static func prepareForOpening(paths: AppPaths, appVersion: String) throws -> PreparedStore {
         let files = FileManager.default
@@ -285,7 +292,7 @@ final class TodoRepository: ProjectPersisting {
             try context.save()
         } catch { context.rollback(); throw error }
         scheduleBackup()
-        onBusinessChange?()
+        contentsChanged()
         return try storedItem(item.id) ?? item
     }
 
@@ -336,7 +343,7 @@ final class TodoRepository: ProjectPersisting {
     private func saveProject(_ value: Project) throws -> Project {
         let before = try syncContentsIfEnabled()
         do { try put(value); try captureSync(before); try context.save() } catch { context.rollback(); throw error }
-        scheduleBackup(); onBusinessChange?(); return try project(value.id)
+        scheduleBackup(); contentsChanged(); return try project(value.id)
     }
 
     func archiveProject(id: UUID) throws -> BoardData { try changeProject(id: id, deleting: false, action: .transferToUnassigned) }
@@ -374,7 +381,7 @@ final class TodoRepository: ProjectPersisting {
             try pruneEventRows()
             let output = try loadBoardData()
             try context.save()
-            scheduleBackup(); onBusinessChange?(); return output
+            scheduleBackup(); contentsChanged(); return output
         } catch { context.rollback(); throw error }
     }
 
@@ -438,6 +445,7 @@ final class TodoRepository: ProjectPersisting {
         backupTask?.cancel()
         let worker = await backupService.value
         try await worker.writeAutomaticBackup(to: paths.backups, appVersion: appVersion)
+        onBackupSuccess?()
     }
 
     func records(in bucket: String) throws -> [StoreRecord] {
@@ -474,6 +482,7 @@ final class TodoRepository: ProjectPersisting {
                 let worker = await factory.value
                 try Task.checkCancellation()
                 try await worker.writeAutomaticBackup(to: directory, appVersion: version)
+                self?.onBackupSuccess?()
             } catch is CancellationError {
                 return
             } catch {

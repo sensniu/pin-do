@@ -2,11 +2,13 @@ import SwiftUI
 
 struct MainWindowView: View {
     @ObservedObject var environment: AppEnvironment
+    @ObservedObject private var navigation: AppNavigation
+    init(environment: AppEnvironment) { self.environment = environment; navigation = environment.navigation }
 
     var body: some View {
         Group {
             if let board = environment.board {
-                WorkspaceView(model: board, managingProjects: $environment.managingProjects, managingAppearance: $environment.managingAppearance).id(ObjectIdentifier(board))
+                WorkspaceView(model: board, environment: environment, navigation: navigation).id(ObjectIdentifier(board))
             } else if environment.opening {
                 VStack(spacing: 16) {
                     ProgressView()
@@ -32,11 +34,31 @@ struct MainWindowView: View {
         .environmentObject(environment.appearance)
         .environmentObject(environment.sync)
         .preferredColorScheme(environment.previewScheme)
-        .onChange(of: environment.managingProjects) { _, open in
-            if !open { environment.board?.refreshFromSync() }
+        .sheet(isPresented: Binding(get: { navigation.panel != nil }, set: { if !$0 { navigation.present(nil) } })) {
+            Group {
+                Group {
+                    switch navigation.panel {
+                    case .settings: SettingsView(environment: environment)
+                    case .projects:
+                        if let board = environment.board { ProjectManagementView(model: board, navigation: navigation) }
+                    case .help: HelpView(navigation: navigation)
+                    case nil: EmptyView()
+                    }
+                }
+            }.overlay(alignment: .bottom) {
+                if let notice = environment.notice {
+                    HStack(alignment: .top) {
+                        Text(notice).font(.callout).textSelection(.enabled)
+                        Spacer(); Button("知道了") { environment.notice = nil }
+                    }.padding(16).frame(maxWidth: 660).background(.regularMaterial)
+                }
+            }.interactiveDismissDisabled()
+        }
+        .onChange(of: navigation.panel) { previous, next in
+            if previous == .projects && next != .projects { environment.board?.refreshFromSync(); environment.analytics.invalidate() }
         }
         .alert("PinDo", isPresented: Binding(
-            get: { environment.notice != nil },
+            get: { environment.notice != nil && navigation.panel == nil },
             set: { if !$0 { environment.notice = nil } }
         )) {
             Button("知道了") { environment.notice = nil }

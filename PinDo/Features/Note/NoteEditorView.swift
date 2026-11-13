@@ -110,7 +110,7 @@ struct NoteEditorView: View {
             HStack(spacing: 12) {
                 if !draft.isNew {
                     Button { editor.deleteConfirmation = true } label: { Image(systemName: "trash") }
-                        .buttonStyle(.plain).help("删除待办…").accessibilityLabel("删除待办")
+                        .buttonStyle(.plain).help("放弃待办…").accessibilityLabel("放弃待办")
                         .frame(width: 28, height: 28).opacity(0.75)
                 }
                 Spacer()
@@ -137,13 +137,13 @@ struct NoteEditorView: View {
             titleFocused = true
         }
         .onChange(of: editor.draft) { _, value in draftChanged(value) }
-        .alert("放弃这次修改？", isPresented: $editor.discardConfirmation) {
+        .alert("舍弃本次修改？", isPresented: $editor.discardConfirmation) {
             Button("继续编辑", role: .cancel) {}
-            Button("放弃修改", role: .destructive, action: cancel)
+            Button("舍弃修改", role: .destructive, action: cancel)
         } message: { Text("这次输入的内容将不会保存。") }
-        .alert("删除此待办？", isPresented: $editor.deleteConfirmation) {
+        .alert("放弃此待办？", isPresented: $editor.deleteConfirmation) {
             Button("取消", role: .cancel) {}
-            Button("删除待办", role: .destructive) { abandon(draft.id) }
-        } message: { Text("它将移出白板，不计为完成。") }
+            Button("放弃待办", role: .destructive) { abandon(draft.id) }
+        } message: { Text("它将移出白板，保留为放弃记录，不计为完成。") }
     }
 }

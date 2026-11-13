@@ -8,6 +8,8 @@ final class BoardModel: ObservableObject {
     @Published private(set) var viewportBounds: CGRect = .zero
     @Published private(set) var layoutRevision = 0
     @Published private(set) var fitRevision = 0
+    @Published private(set) var zoomRevision = 0
+    private(set) var zoomFactor: CGFloat = 1
     @Published private(set) var undo: CompletionUndo?
     @Published var draft: NoteDraft?
     @Published var errorMessage: String?
@@ -374,6 +376,7 @@ final class BoardModel: ObservableObject {
         layout.updateBounds(visibleIDs: Set(visibleItems.map(\.id)))
         viewportBounds = layout.bounds; fitRevision += 1
     }
+    func zoomBoard(by factor: CGFloat) { guard draft == nil else { return }; zoomFactor = factor; zoomRevision += 1 }
 
     func bringToFront(_ id: UUID) {
         guard visibleItems.contains(where: { $0.id == id }) else { return }
