@@ -52,6 +52,8 @@ final class SyncCoordinator: ObservableObject {
     deinit { scheduled?.cancel(); polling?.cancel() }
     func attach(_ repository: TodoRepository) {
         self.repository = repository
+        do { try repository.prepareCurrentSync() } catch { self.error = error.localizedDescription; return }
+        didReceive?()
         repository.onBusinessChange = { [weak self] in self?.changed() }
         refreshStatus()
         polling?.cancel()
@@ -71,11 +73,12 @@ final class SyncCoordinator: ObservableObject {
             guard let state = try repository?.syncState() else { message = "未启用同步"; return }
             let graph = try SyncGraph(state.changes)
             conflicts = try graph.conflicts()
-            let edited = Set(state.changes.flatMap(\.events).filter { $0.kind == .edited }.map(\.itemID))
+            let edited = Set(state.changes.flatMap { $0.endedEdits ?? [] })
             retainedItems = try graph.projection().items.filter { $0.status == .conflicted || ($0.status != .active && edited.contains($0.id)) }
             if !state.enabled { message = "同步已暂停" }
             else if state.pendingCount > 0 { message = "待同步 \(state.pendingCount) 项" }
-            else if !state.inbox.isEmpty || state.received != state.cursors { message = "等待补齐同步数据" }
+            else if state.current?.cleanupPending == true { message = "待清理同步工作" }
+            else if !(state.current?.inbox.isEmpty ?? true) || !state.inbox.isEmpty || state.received != state.cursors { message = "等待补齐同步数据" }
             else if !conflicts.isEmpty { message = "\(conflicts.count) 项冲突" }
             else { message = state.lastSuccess == nil ? "等待同步" : "已同步" }
         } catch { self.error = error.localizedDescription; message = "同步数据需要检查" }
@@ -120,16 +123,8 @@ final class SyncCoordinator: ObservableObject {
         busy = true; error = nil; message = "正在验证连接…"
         defer { busy = false; refreshStatus() }
         let effectivePassword = password.isEmpty ? try credentials.password(for: connection.credentialKey) ?? "" : password
-        let client = try WebDAVClient(connection: connection, password: effectivePassword)
-        if previous?.libraryID == nil { try await client.prepareRootHierarchy() }
-        if let expected = previous?.libraryID {
-            let root = try await client.get("library.json")
-            guard root.status != 404 else { throw SyncFailure.wrongLibrary }
-            guard root.status == 200 else { throw SyncFailure.http(root.status) }
-            let library = try SyncCodec.unwrap(SyncLibrary.self, root.data)
-            guard library.id == expected else { throw SyncFailure.wrongLibrary }
-            guard library.version == 1 else { throw SyncFailure.unsupported }
-        }
+        let client = try WebDAVClient(connection: connection, password: effectivePassword, installationID: previous?.writerID ?? UUID())
+        try await client.prepareRootHierarchy()
         let creationMode = try await client.probe()
         _ = try await client.children("")
         try credentials.save(effectivePassword, for: connection.credentialKey)
@@ -137,7 +132,7 @@ final class SyncCoordinator: ObservableObject {
         didReceive?()
         guard var state = try repository.syncState() else { throw SyncFailure.invalidData }
         if state.libraryID == nil && state.connection != connection { state.proposedLibraryID = nil }
-        state.connection = connection; state.enabled = true; state.remoteCreationMode = creationMode
+        state.connection = connection; state.enabled = true; state.remoteCreationMode = creationMode; state.remoteSafetyVersion = 4
         try repository.saveSyncState(state)
         // Scheduled after the configuration operation releases the single-flight gate.
         schedule(after: 0.2)
@@ -148,7 +143,12 @@ final class SyncCoordinator: ObservableObject {
         do {
             let password = try credentials.password(for: connection.credentialKey) ?? ""
             let client = try WebDAVClient(connection: connection, password: password,
-                creationMode: repository?.syncState()?.remoteCreationMode ?? .conditionalPut)
+                creationMode: repository?.syncState()?.remoteSafetyVersion == 4 ? repository?.syncState()?.remoteCreationMode : nil, installationID: repository?.syncState()?.writerID ?? UUID())
+            if try repository?.syncState()?.remoteSafetyVersion != 4 {
+                try await client.prepareRootHierarchy()
+                let mode = try await client.probe()
+                if var state = try repository?.syncState() { state.remoteCreationMode = mode; state.remoteSafetyVersion = 4; try repository?.saveSyncState(state) }
+            }
             let more = try await exchange(using: client)
             failures = 0; retryNotBefore = nil; busy = false; refreshStatus()
             if more || rerun { schedule(after: 5) }
@@ -167,145 +167,191 @@ final class SyncCoordinator: ObservableObject {
             schedule(after: retry)
         }
     }
-    /// Also exercised with an in-memory DAV server; does not invoke UI or Keychain.
+    /// Protocol v3: immutable recoverable work, conditional publication, and verified cleanup.
     func exchange(using dav: any DAVTransport) async throws -> Bool {
-        guard let repository, var initial = try repository.syncState() else { throw SyncFailure.invalidData }
-        let libraryResponse = try await dav.get("library.json")
+        guard let repository else { throw SyncFailure.invalidData }
+        try repository.prepareCurrentSync()
+        guard var initial = try repository.syncState() else { throw SyncFailure.invalidData }
+        let response = try await dav.get("library.json")
         let library: SyncLibrary
-        if libraryResponse.status == 404 {
-            guard initial.libraryID == nil else { throw SyncFailure.wrongLibrary }
-            // Persist the proposal before staging bytes so an interrupted first publish uses the same key.
-            initial = try repository.syncState()!
+        if response.status == 404 {
+            if let client = dav as? WebDAVClient { try await client.prepareRootHierarchy() }
+            else { try await dav.directory("") }
             if initial.proposedLibraryID == nil {
                 initial.proposedLibraryID = UUID(); try repository.saveSyncState(initial)
             }
-            let proposed = SyncLibrary(id: initial.proposedLibraryID!)
-            let bytes = try SyncCodec.wrap(proposed)
-            do { try await dav.create("library.json", data: bytes) }
-            catch SyncFailure.identityCollision {
-                // Another device won atomic creation. An unbound device may join that verified library.
-            }
+            do { try await dav.create("library.json", data: SyncCodec.wrap(SyncLibrary(id: initial.proposedLibraryID!))) }
+            catch SyncFailure.identityCollision { }
             let stored = try await dav.get("library.json")
             guard stored.status == 200 else { throw SyncFailure.http(stored.status) }
             library = try SyncCodec.unwrap(SyncLibrary.self, stored.data)
         } else {
-            guard libraryResponse.status == 200 else { throw SyncFailure.http(libraryResponse.status) }
-            library = try SyncCodec.unwrap(SyncLibrary.self, libraryResponse.data)
-        }
-        guard library.version == 1 else { throw SyncFailure.unsupported }
-        guard initial.libraryID == nil || initial.libraryID == library.id else { throw SyncFailure.wrongLibrary }
-        if libraryResponse.status == 200, initial.libraryID == nil, let proposal = initial.proposedLibraryID {
-            // Finish cleanup after a crash, including when a different creator won the root race.
-            do { try await dav.create("library.json", data: SyncCodec.wrap(SyncLibrary(id: proposal))) }
-            catch SyncFailure.identityCollision {}
-        }
-        // Reload after every await before mutating durable state: local edits may have happened meanwhile.
-        initial = try repository.syncState()!
-        initial.libraryID = library.id; initial.proposedLibraryID = nil; try repository.saveSyncState(initial)
-        if initial.outgoing.sequence == 0 { try await dav.directory("writers") }
-        let writer = initial.writerID.uuidString.lowercased()
-        let writerPath = "writers/" + writer
-        if initial.outgoing.sequence == 0 {
-            try await dav.directory(writerPath)
-            try await dav.create(writerPath + "/identity.json", data: SyncCodec.wrap(initial.writerID))
-        }
-        let discovered = try await dav.children("writers")
-        let known = try repository.syncState()!
-        guard discovered.contains(writer), Set(known.received.keys).union(known.cursors.keys).isSubset(of: Set(discovered)) else { throw SyncFailure.incompleteListing }
-        var budget = 24, more = false
-        for other in discovered.sorted() {
-            guard let otherID = UUID(uuidString: other), other == otherID.uuidString.lowercased() else { throw SyncFailure.invalidData }
-            let path = "writers/" + other
-            let response = try await dav.get(path + "/head.json")
-            if response.status == 404 {
-                // A new writer may have no head yet. Losing a previously observed head is an error.
-                let current = try repository.syncState()!
-                guard (current.received[other] ?? current.cursors[other] ?? SyncCursor()).sequence == 0,
-                      other != writer || current.outgoing.sequence == 0 else { throw SyncFailure.incompleteListing }
-                continue
-            }
             guard response.status == 200 else { throw SyncFailure.http(response.status) }
-            let head = try SyncCodec.unwrap(SyncHead.self, response.data)
-            guard head.version == 1, head.libraryID == library.id, head.writerID == otherID, head.cursor.sequence >= 0 else { throw SyncFailure.unsupported }
-            let state = try repository.syncState()!
-            var cursor = state.received[other] ?? state.cursors[other] ?? SyncCursor()
-            guard head.cursor.sequence >= cursor.sequence else { throw SyncFailure.identityCollision }
-            if head.cursor.sequence == cursor.sequence {
-                guard head.cursor.checksum == cursor.checksum else { throw SyncFailure.identityCollision }
-            }
-            while cursor.sequence < head.cursor.sequence && budget > 0 {
-                let sequence = cursor.sequence + 1
-                let packetResponse = try await dav.get(Self.packetPath(writer: other, sequence: sequence))
-                guard packetResponse.status == 200 else { throw SyncFailure.http(packetResponse.status) }
-                let packet = try SyncCodec.unwrap(SyncPacket.self, packetResponse.data)
-                guard packet.version == 1, packet.libraryID == library.id, packet.writerID == otherID,
-                      packet.sequence == sequence, packet.previous == cursor.checksum else { throw SyncFailure.invalidData }
-                cursor = SyncCursor(sequence: sequence, checksum: SyncCodec.hash(packetResponse.data))
-                try repository.stageReceived(packet.changes, writer: other, cursor: cursor)
-                budget -= 1
-            }
-            if cursor.sequence == head.cursor.sequence {
-                guard cursor.checksum == head.cursor.checksum else { throw SyncFailure.invalidData }
-            } else { more = true }
+            library = try SyncCodec.unwrap(SyncLibrary.self, response.data)
+        }
+        guard library.version == 3 else { throw SyncFailure.unsupported }
+        if response.status == 200, let proposal = initial.proposedLibraryID {
+            // Recover a first-create staging cleanup after an interrupted request or another creator winning.
+            do { try await dav.create("library.json", data: SyncCodec.wrap(SyncLibrary(id: proposal))) }
+            catch SyncFailure.identityCollision { }
+        }
+        if initial.libraryID != library.id {
+            let existingIndex = try await dav.get("index.json")
+            if existingIndex.status != 404 { _ = try decodeIndex(existingIndex, library: library.id) }
+            try repository.resetCurrentCloud(library.id)
+        }
+        try await dav.directory("records")
+        try await dav.directory("_work")
+        try await recoverCloudWork(dav, library: library.id)
+        let index = try await readCurrentIndex(dav, library: library.id)
+        var count = 0, more = false
+        for (entity, revision) in index.records.sorted(by: { $0.key < $1.key }) {
+            let local = try repository.syncState()!.current!
+            if max(local.seen[entity, default: 0], local.inbox[entity]?.revision ?? 0) >= revision { continue }
+            if count >= 24 { more = true; break }
+            let stored = try await dav.get(SyncCurrent.path(entity))
+            let record = try decodeCurrent(stored, entity: entity, library: library.id)
+            guard record.revision >= revision else { throw SyncFailure.invalidData }
+            try repository.stageCurrent([record]); count += 1
         }
         do { try repository.applyReceived(); didReceive?() }
         catch SyncFailure.missingDependency { more = true }
-        // A single sealed packet per round bounds request count and makes retries byte-for-byte stable.
+        let sealed = try repository.sealCurrent()
+        for mutation in sealed.prefix(24) {
+            let record = try await publishWork(mutation, dav: dav, library: library.id)
+            try repository.stageCurrent([record]); try repository.acknowledgeCurrent(mutation)
+            do { try repository.applyReceived(); didReceive?() }
+            catch SyncFailure.missingDependency { more = true }
+        }
         var state = try repository.syncState()!
-        if state.pending == nil {
-            let changes = Array(state.changes.filter { state.outboxIDs.contains($0.id) }.prefix(64))
-            if !changes.isEmpty {
-                let packet = SyncPacket(libraryID: library.id, writerID: state.writerID, sequence: state.outgoing.sequence + 1, previous: state.outgoing.checksum, changes: changes)
-                state.pending = try SyncCodec.wrap(packet); try repository.saveSyncState(state)
-            }
-        }
-        if let bytes = state.pending {
-            let packet = try SyncCodec.unwrap(SyncPacket.self, bytes)
-            guard packet.libraryID == library.id, packet.writerID == state.writerID,
-                  packet.sequence == state.outgoing.sequence + 1, packet.previous == state.outgoing.checksum else { throw SyncFailure.identityCollision }
-            let local = Dictionary(uniqueKeysWithValues: state.changes.map { ($0.id, $0) })
-            for change in packet.changes {
-                guard let stored = local[change.id], try SyncCodec.encode(stored) == SyncCodec.encode(change) else { throw SyncFailure.identityCollision }
-            }
-            let path = Self.packetPath(writer: writer, sequence: packet.sequence)
-            if packet.sequence == 1 { try await dav.directory(writerPath + "/segments") }
-            if (packet.sequence - 1) % 128 == 0 { try await dav.directory(writerPath + "/segments/\((packet.sequence - 1) / 128)") }
-            try await dav.create(path, data: bytes)
-            let cursor = SyncCursor(sequence: packet.sequence, checksum: SyncCodec.hash(bytes))
-            let headPath = writerPath + "/head.json"
-            let old = try await dav.get(headPath)
-            let headBytes = try SyncCodec.wrap(SyncHead(libraryID: library.id, writerID: state.writerID, cursor: cursor))
-            if old.status == 404 { try await dav.create(headPath, data: headBytes) }
-            else {
-                guard old.status == 200 else { throw SyncFailure.http(old.status) }
-                guard let etag = DAVProbe.usableTag(old.etag) else {
-                    throw SyncFailure.serverCapability(stage: "读取发布索引 ETag", detail: "发布索引缺少可用于版本校验的 ETag。", status: old.status)
-                }
-                let oldHead = try SyncCodec.unwrap(SyncHead.self, old.data)
-                guard oldHead.libraryID == library.id, oldHead.writerID == state.writerID, oldHead.version == 1,
-                      oldHead.cursor == state.outgoing || oldHead.cursor == cursor else { throw SyncFailure.identityCollision }
-                let update = try await dav.request("PUT", path: headPath, body: headBytes, headers: ["If-Match": etag])
-                guard [200, 201, 204, 409, 412].contains(update.status) else { throw SyncFailure.http(update.status) }
-            }
-            let verified = try await dav.get(headPath)
-            guard verified.status == 200, verified.data == headBytes else { throw SyncFailure.identityCollision }
-            state = try repository.syncState()!
-            guard state.pending == bytes else { throw SyncFailure.identityCollision }
-            state.published.formUnion(packet.changes.map(\.id)); state.outboxIDs.subtract(packet.changes.map(\.id)); state.outgoing = cursor; state.pending = nil
-            state.cursors[writer] = cursor; state.received[writer] = cursor
-            try repository.saveSyncState(state)
-        } else {
-            // Detect a restored/cloned writer even if there is currently no local work to publish.
-            let current = try repository.syncState()!
-            if let seen = current.received[writer], seen != current.outgoing { throw SyncFailure.identityCollision }
-        }
-        state = try repository.syncState()!
-        more = more || state.pendingCount > 0 || !state.inbox.isEmpty
+        more = more || state.pendingCount > 0 || !state.current!.inbox.isEmpty || state.current!.cleanupPending == true
         if !more { state.lastSuccess = .now; try repository.saveSyncState(state) }
         return more
     }
-    static func packetPath(writer: String, sequence: Int) -> String {
-        "writers/\(writer)/segments/\((sequence - 1) / 128)/\(sequence).json"
+    func readCurrentIndex(_ dav: any DAVTransport, library: UUID) async throws -> SyncCurrentIndex {
+        let response = try await dav.get("index.json")
+        if response.status == 404 {
+            guard try repository?.syncState()?.current?.indexEstablished != true else {
+                throw SyncFailure.configuration("云端索引缺失，本地内容已保留。若要重新初始化，请完整清空专用云目录（包括 library.json）。")
+            }
+            do { try await dav.create("index.json", data: SyncCodec.wrap(SyncCurrentIndex(libraryID: library))) }
+            catch SyncFailure.identityCollision { }
+            let stored = try await dav.get("index.json")
+            let index = try decodeIndex(stored, library: library)
+            try rememberIndex(index)
+            return index
+        }
+        let index = try decodeIndex(response, library: library)
+        try rememberIndex(index)
+        return index
+    }
+    private func rememberIndex(_ index: SyncCurrentIndex) throws {
+        guard var state = try repository?.syncState() else { throw SyncFailure.invalidData }
+        let known = state.current!.indexWatermarks
+        guard known.allSatisfy({ index.records[$0.key, default: -1] >= $0.value }) else { throw SyncFailure.incompleteListing }
+        state.current!.indexEstablished = true; state.current!.indexWatermarks = index.records
+        try repository?.saveSyncState(state)
+    }
+    func decodeIndex(_ response: DAVResponse, library: UUID) throws -> SyncCurrentIndex {
+        guard response.status == 200 else { throw SyncFailure.http(response.status) }
+        guard response.data.count <= SyncCurrent.maxIndexBytes else { throw SyncFailure.invalidData }
+        let index = try SyncCodec.unwrap(SyncCurrentIndex.self, response.data)
+        guard index.version == 3, index.libraryID == library,
+              index.records.allSatisfy({ SyncCurrent.validEntity($0.key) && $0.value > 0 }) else { throw SyncFailure.invalidData }
+        return index
+    }
+    func decodeCurrent(_ response: DAVResponse, entity: String, library: UUID) throws -> SyncEntityRecord {
+        guard SyncCurrent.validEntity(entity) else { throw SyncFailure.invalidData }
+        guard response.status == 200 else { throw SyncFailure.http(response.status) }
+        guard response.data.count <= SyncCurrent.maxRecordBytes else { throw SyncFailure.invalidData }
+        let record = try SyncCodec.unwrap(SyncEntityRecord.self, response.data)
+        let entityID = UUID(uuidString: String(entity.split(separator: ":").last!))!
+        guard record.version == 3, record.libraryID == library, record.entity == entity, record.revision > 0,
+              !record.change.writes.isEmpty, record.change.writes.allSatisfy({ $0.entity == entity && $0.parents.isEmpty }),
+              record.change.events.allSatisfy({ $0.itemID == entityID }), record.change.assignments.allSatisfy({ $0.itemID == entityID }),
+              record.receipts.allSatisfy({ UUID(uuidString: $0.key)?.uuidString.lowercased() == $0.key && $0.value > 0 }) else { throw SyncFailure.invalidData }
+        guard Set(record.change.writes.map(\.field)).isSuperset(of: SyncGraph.fields(for: entity.hasPrefix("todo:") ? "todo" : "project")),
+              let proofs = record.receiptOperations, Set(proofs.keys) == Set(record.receipts.keys),
+              proofs.allSatisfy({ record.receipts[$0.key] == $0.value.sequence && $0.value.digest.count == 64 }),
+              let publication = record.publication, proofs[publication.writerID.uuidString.lowercased()] == publication.receipt else { throw SyncFailure.identityCollision }
+        if let state = try repository?.syncState(), let current = state.current {
+            let received = record.receipts[state.writerID.uuidString.lowercased(), default: 0]
+            guard received >= current.acknowledged[entity, default: 0], received <= current.counters[entity, default: 0] else { throw SyncFailure.identityCollision }
+        }
+        for write in record.change.writes { try SyncGraph.validate(write) }
+        let tokens = Set(record.change.writes.filter { $0.field == "lifecycle" }.map(\.id))
+        guard record.change.events.allSatisfy({ tokens.contains($0.id) && [.completed, .abandoned].contains($0.kind) }) else { throw SyncFailure.invalidData }
+        if entity.hasPrefix("project:") {
+            for write in record.change.writes where write.field == "lifecycle" {
+                let life = try SyncCodec.decode(SyncLife.self, write.value)
+                guard life.retired != nil, life.transition != nil, life.observed != nil else { throw SyncFailure.invalidData }
+            }
+        }
+        return record
+    }
+    func publishCurrent(_ mutation: SyncMutation, dav: any DAVTransport, library: UUID) async throws -> SyncEntityRecord {
+        let path = try SyncCurrent.path(mutation.entity)
+        for _ in 0..<5 {
+            let old = try await dav.get(path)
+            if old.status == 404 {
+                let index = try decodeIndex(await dav.get("index.json"), library: library)
+                guard index.records[mutation.entity] == nil, try repository?.syncState()?.current?.seen[mutation.entity] == nil,
+                      Set(mutation.change.writes.map(\.field)).isSuperset(of: SyncGraph.fields(for: mutation.entity.hasPrefix("todo:") ? "todo" : "project")) else {
+                    throw SyncFailure.configuration("云端已有事项的记录缺失，本地完整内容和未确认修改已保留。")
+                }
+            }
+            let record = old.status == 404 ? SyncEntityRecord(libraryID: library, entity: mutation.entity,
+                change: SyncChange(writerID: mutation.writerID, date: .now, writes: [])) : try decodeCurrent(old, entity: mutation.entity, library: library)
+            let next = try SyncCurrent.merging(mutation, into: record)
+            if next.revision == record.revision { return record }
+            let bytes = try SyncCurrent.encoded(next, limit: SyncCurrent.maxRecordBytes)
+            do {
+                if old.status == 404 { try await dav.create(path, data: bytes) }
+                else {
+                    guard let tag = DAVProbe.usableTag(old.etag) else { throw SyncFailure.serverCapability(stage: "读取最新记录 ETag", detail: "记录缺少可用于版本校验的 ETag。", status: old.status) }
+                    let update = try await dav.request("PUT", path: path, body: bytes, headers: ["If-Match": tag])
+                    if [409, 412].contains(update.status) { continue }
+                    guard [200, 201, 204].contains(update.status) else { throw SyncFailure.http(update.status) }
+                }
+            } catch SyncFailure.identityCollision { continue }
+            catch {
+                if let check = try? await dav.get(path), let saved = try? decodeCurrent(check, entity: mutation.entity, library: library),
+                   saved.receipts[mutation.writerID.uuidString.lowercased(), default: 0] >= mutation.sequence {
+                    _ = try SyncCurrent.merging(mutation, into: saved)
+                    return saved
+                }
+                throw error
+            }
+            let saved = try decodeCurrent(await dav.get(path), entity: mutation.entity, library: library)
+            if saved.receipts[mutation.writerID.uuidString.lowercased(), default: 0] >= mutation.sequence { _ = try SyncCurrent.merging(mutation, into: saved); return saved }
+        }
+        throw SyncFailure.configuration("其他设备正在更新同一事项，本地修改已保留，请稍后重试。")
+    }
+    func advertiseCurrent(_ records: [SyncEntityRecord], dav: any DAVTransport, library: UUID) async throws {
+        for _ in 0..<5 {
+            let old = try await dav.get("index.json")
+            var index = try decodeIndex(old, library: library)
+            try rememberIndex(index)
+            var changed = false
+            for record in records where record.revision > index.records[record.entity, default: 0] {
+                index.records[record.entity] = record.revision; changed = true
+            }
+            if !changed { try rememberIndex(index); return }
+            guard let tag = DAVProbe.usableTag(old.etag) else { throw SyncFailure.serverCapability(stage: "读取最新索引 ETag", detail: "索引缺少可用于版本校验的 ETag。", status: old.status) }
+            let bytes = try SyncCurrent.encoded(index, limit: SyncCurrent.maxIndexBytes)
+            do {
+                let update = try await dav.request("PUT", path: "index.json", body: bytes, headers: ["If-Match": tag])
+                if [409, 412].contains(update.status) { continue }
+                guard [200, 201, 204].contains(update.status) else { throw SyncFailure.http(update.status) }
+            } catch {
+                if let check = try? await dav.get("index.json"), let saved = try? decodeIndex(check, library: library),
+                   records.allSatisfy({ saved.records[$0.entity, default: 0] >= $0.revision }) { try rememberIndex(saved); return }
+                throw error
+            }
+            let saved = try decodeIndex(await dav.get("index.json"), library: library)
+            if records.allSatisfy({ saved.records[$0.entity, default: 0] >= $0.revision }) { try rememberIndex(saved); return }
+        }
+        throw SyncFailure.configuration("云端索引正在被其他设备更新，待发送内容已保留，请稍后重试。")
     }
     func resolve(_ conflict: SyncConflict, candidate: SyncWrite) {
         do { try repository?.resolveSyncConflict(conflict, candidate: candidate); didReceive?(); refreshStatus() }

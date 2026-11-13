@@ -96,7 +96,7 @@ struct SyncConflictsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("同步冲突").font(.title2.weight(.semibold))
-            Text("不同设备修改了同一内容。所有候选已保存；选择一个版本后，其他版本仍保留在同步历史中。")
+            Text("不同设备修改了同一内容。未解决的候选会保留；采用某个版本后，已解决的旧候选会清理。")
                 .font(.callout).foregroundStyle(.secondary)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 20) {

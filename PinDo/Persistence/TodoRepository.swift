@@ -47,6 +47,7 @@ final class TodoRepository: ProjectPersisting {
 
     convenience init(paths: AppPaths, appVersion: String) throws {
         try self.init(paths: paths, appVersion: appVersion, prepared: Self.prepareForOpening(paths: paths, appVersion: appVersion))
+        try prepareCompactStorage()
     }
 
     init(paths: AppPaths, appVersion: String, prepared: PreparedStore) {
@@ -71,6 +72,7 @@ final class TodoRepository: ProjectPersisting {
     /// Versioned payload migration and the manifest handshake run before any board is created.
     nonisolated private static func prepare(paths: AppPaths, appVersion: String) throws -> ModelContainer {
         let files = FileManager.default
+        try StorageMaintenance.recoverManifest(paths.manifest)
         let hasStore = files.fileExists(atPath: paths.store.path)
         let hasManifest = files.fileExists(atPath: paths.manifest.path)
         var manifest: StoreManifest
@@ -92,7 +94,7 @@ final class TodoRepository: ProjectPersisting {
             guard !hasStore, children.isEmpty else { throw StoreFailure.inconsistentStore }
             manifest = StoreManifest(storeID: UUID(), createdAt: .now, lastAppVersion: appVersion,
                                      migrationPending: true)
-            try JSONEncoder().encode(manifest).write(to: paths.manifest, options: .atomic)
+            try StorageMaintenance.atomicWrite(JSONEncoder().encode(manifest), to: paths.manifest)
         }
         let schema = Schema(versionedSchema: StoreSchemaV1.self)
         let config = ModelConfiguration(schema: schema, url: paths.store, cloudKitDatabase: .none)
@@ -108,7 +110,7 @@ final class TodoRepository: ProjectPersisting {
             let converted = try archive.upgraded()
             if manifest.upgradeSnapshot == nil { manifest.upgradeSnapshot = try backupClosedStore(paths: paths) }
             manifest.formatVersion = 2; manifest.migrationPending = true; manifest.lastAppVersion = appVersion
-            try JSONEncoder().encode(manifest).write(to: paths.manifest, options: .atomic)
+            try StorageMaintenance.atomicWrite(JSONEncoder().encode(manifest), to: paths.manifest)
             do {
                 for row in all { context.delete(row) }
                 for record in converted.records { context.insert(StoreRecord(key: record.key, bucket: record.bucket, payload: record.payload)) }
@@ -124,7 +126,7 @@ final class TodoRepository: ProjectPersisting {
             let diskVersion = try JSONDecoder().decode(StoreMetadata.self, from: metadata[0].payload).formatVersion
             guard [2, 3].contains(diskVersion), diskVersion >= manifest.formatVersion else { throw StoreFailure.unsupportedVersion }
             manifest.formatVersion = diskVersion
-            if manifest.migrationPending == true || diskVersion == 3 {
+            if manifest.migrationPending == true || diskVersion == 3 || manifest.lastAppVersion != appVersion {
                 var archive = StoreArchive(appVersion: appVersion, createdAt: .now,
                                            records: all.map { StoredValue(key: $0.key, bucket: $0.bucket, payload: $0.payload) })
                 archive.formatVersion = diskVersion
@@ -136,11 +138,39 @@ final class TodoRepository: ProjectPersisting {
         }
         manifest.lastAppVersion = appVersion
         manifest.migrationPending = nil; manifest.upgradeSnapshot = nil
-        try JSONEncoder().encode(manifest).write(to: paths.manifest, options: .atomic)
+        try StorageMaintenance.atomicWrite(JSONEncoder().encode(manifest), to: paths.manifest)
         return container
     }
 
     deinit { backupTask?.cancel() }
+
+    func prepareCompactStorage() throws {
+        try prepareCurrentSync()
+        do { try pruneEventRows(); try context.save() }
+        catch { context.rollback(); throw error }
+        scheduleBackup()
+    }
+
+    /// Only live completion/abandonment tokens are stored, never ordinary edit or undo trails.
+    func pruneEventRows() throws {
+        let tokens: Set<UUID>
+        if let state = try syncState(), state.current?.protocolVersion == 3 {
+            tokens = Set(try SyncGraph(state.changes).projection().events.map(\.id))
+        } else {
+            let rows = try context.fetch(FetchDescriptor<StoreRecord>()).filter { $0.bucket.hasPrefix("todo-") }
+            let items = try rows.map { try JSONDecoder().decode(TodoItem.self, from: $0.payload) }
+            let events = try records(in: "event").map { try JSONDecoder().decode(TodoEvent.self, from: $0.payload) }
+            var kept = Set<UUID>()
+            for item in items where item.status == .completed || item.status == .abandoned {
+                let candidates = events
+                    .filter { $0.itemID == item.id && $0.kind == (item.status == .completed ? .completed : .abandoned) }
+                    .sorted { $0.occurredAt > $1.occurredAt }
+                if let event = candidates.first { kept.insert(event.id) }
+            }
+            tokens = kept
+        }
+        for row in try records(in: "event") where !tokens.contains(try JSONDecoder().decode(TodoEvent.self, from: row.payload).id) { context.delete(row) }
+    }
 
     func loadProjects() throws -> [Project] {
         try records(in: "project").map {
@@ -160,7 +190,7 @@ final class TodoRepository: ProjectPersisting {
         for item in items {
             if let id = item.projectID, lookup[id]?.status != .active { throw StoreFailure.inconsistentStore }
             for assignment in item.projectAssignments {
-                guard assignment.changedAt.timeIntervalSince1970.isFinite,
+                guard (assignment.changedAt?.timeIntervalSince1970.isFinite ?? true),
                       assignment.previousProjectID.map({ lookup[$0] != nil }) ?? true,
                       assignment.projectID.map({ lookup[$0] != nil }) ?? true else { throw StoreFailure.inconsistentStore }
             }
@@ -251,6 +281,7 @@ final class TodoRepository: ProjectPersisting {
             context.insert(StoreRecord(key: "event:\(event.id.uuidString)", bucket: "event", payload: try JSONEncoder().encode(event)))
             if clearDraft, let draft = try record(key: "editor-draft") { context.delete(draft) }
             try captureSync(syncBefore, baseline: baseline)
+            try pruneEventRows()
             try context.save()
         } catch { context.rollback(); throw error }
         scheduleBackup()
@@ -340,6 +371,7 @@ final class TodoRepository: ProjectPersisting {
             if deleting { value.deletedAt = now } else { value.archivedAt = now }
             try put(value)
             try captureSync(before)
+            try pruneEventRows()
             let output = try loadBoardData()
             try context.save()
             scheduleBackup(); onBusinessChange?(); return output
@@ -376,7 +408,7 @@ final class TodoRepository: ProjectPersisting {
         if try syncState() != nil { try mergeSyncBackup(archive); return }
         let before = try BackupCodec.encode(self.archive())
         try FileManager.default.createDirectory(at: paths.backups, withIntermediateDirectories: true)
-        try before.write(to: paths.backups.appendingPathComponent("before-restore.pindobackup"), options: .atomic)
+        try StorageMaintenance.atomicWrite(before, to: paths.backups.appendingPathComponent("before-restore.pindobackup"))
         do {
             for row in try context.fetch(FetchDescriptor<StoreRecord>()) { context.delete(row) }
             for record in archive.records { context.insert(StoreRecord(key: record.key, bucket: record.bucket, payload: record.payload)) }
@@ -385,6 +417,10 @@ final class TodoRepository: ProjectPersisting {
                 restored.outgoing = SyncCursor(); restored.pending = nil
                 restored.cursors = [:]; restored.received = [:]; restored.published = []
                 restored.outboxIDs = Set(restored.changes.map(\.id)); restored.lastSuccess = nil
+                if restored.current?.protocolVersion == 3 {
+                    restored.current = CurrentSyncState()
+                    for change in restored.changes { try restored.current!.enqueue(change, writer: restored.writerID) }
+                } else { restored.current = nil }
                 try putRestoredSyncState(restored)
             }
             try context.save()
@@ -392,8 +428,9 @@ final class TodoRepository: ProjectPersisting {
         if archive.formatVersion == 3 {
             var manifest = try JSONDecoder().decode(StoreManifest.self, from: Data(contentsOf: paths.manifest))
             manifest.formatVersion = 3
-            try JSONEncoder().encode(manifest).write(to: paths.manifest, options: .atomic)
+            try StorageMaintenance.atomicWrite(JSONEncoder().encode(manifest), to: paths.manifest)
         }
+        try prepareCompactStorage()
         scheduleBackup()
     }
 
@@ -450,16 +487,22 @@ final class TodoRepository: ProjectPersisting {
         let directory = paths.backups.appendingPathComponent("before-upgrade-\(UUID().uuidString)", isDirectory: true)
         try files.createDirectory(at: directory, withIntermediateDirectories: true)
         do {
-            try DatabaseSnapshot.copy(from: paths.store, to: directory.appendingPathComponent("PinDo.store"))
             try files.copyItem(at: paths.manifest, to: directory.appendingPathComponent("StoreInfo.json"))
-            let previous = try files.contentsOfDirectory(at: paths.backups, includingPropertiesForKeys: [.creationDateKey])
-                .filter { $0.lastPathComponent.hasPrefix("before-upgrade-") }
-                .sorted {
-                    let left = (try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-                    let right = (try? $1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-                    return left > right
-                }
-            for expired in previous.dropFirst(3) { try files.removeItem(at: expired) }
+            try DatabaseSnapshot.copy(from: paths.store, to: directory.appendingPathComponent("PinDo.store"))
+            let identity = try JSONDecoder().decode(StoreManifest.self, from: Data(contentsOf: directory.appendingPathComponent("StoreInfo.json")))
+            for expired in try files.contentsOfDirectory(at: paths.backups, includingPropertiesForKeys: [.isSymbolicLinkKey, .isDirectoryKey]) where expired.lastPathComponent != directory.lastPathComponent {
+                let name = expired.lastPathComponent
+                guard name.hasPrefix("before-upgrade-"), UUID(uuidString: String(name.dropFirst("before-upgrade-".count))) != nil,
+                      name != identity.upgradeSnapshot,
+                      try expired.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey]).isSymbolicLink != true,
+                      try expired.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
+                let contents = try files.contentsOfDirectory(at: expired, includingPropertiesForKeys: [.isSymbolicLinkKey])
+                if contents.isEmpty { try files.removeItem(at: expired); continue }
+                guard Set(contents.map(\.lastPathComponent)).isSubset(of: ["PinDo.store", "PinDo.store-wal", "PinDo.store-shm", "PinDo.store-journal", "StoreInfo.json"]),
+                      try contents.allSatisfy({ try $0.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true }) else { continue }
+                guard let bytes = try? Data(contentsOf: expired.appendingPathComponent("StoreInfo.json")), let old = try? JSONDecoder().decode(StoreManifest.self, from: bytes) else { continue }
+                if old.storeID == identity.storeID { try files.removeItem(at: expired) }
+            }
             return directory.lastPathComponent
         } catch {
             try? files.removeItem(at: directory)

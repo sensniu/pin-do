@@ -45,11 +45,10 @@ final class MigrationTests: XCTestCase {
         let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
         let records = try legacyRecords(); try writeLegacy(records, root: root)
         let expectedIDs = Set(records.filter { $0.bucket.hasPrefix("todo-") }.map(\.key))
-        let expectedEvents = Set(records.filter { $0.bucket == "event" }.map(\.key))
         var store: TodoRepository? = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.2.0")
         let output = try store!.archive()
         XCTAssertEqual(Set(output.records.filter { $0.bucket.hasPrefix("todo-") }.map(\.key)), expectedIDs)
-        XCTAssertEqual(Set(output.records.filter { $0.bucket == "event" }.map(\.key)), expectedEvents)
+        XCTAssertTrue(output.records.filter { $0.bucket == "event" }.isEmpty) // Final states/times remain; creation/edit trails do not.
         let ids = Set(try store!.loadProjects().map(\.id))
         XCTAssertEqual(ids.count, 2)
         XCTAssertEqual(try store!.loadDraft()?.notes, "unsaved note")

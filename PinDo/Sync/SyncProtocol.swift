@@ -5,7 +5,7 @@ import CryptoKit
 enum SyncCodec {
     static func encode<T: Encodable>(_ value: T) throws -> Data {
         let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .custom { date, encoder in
             guard date.timeIntervalSince1970.isFinite else { throw SyncFailure.invalidData }
             var container = encoder.singleValueContainer()
@@ -67,6 +67,7 @@ struct SyncWrite: Codable, Equatable, Sendable, Identifiable {
     let field: String
     let parents: [UUID]
     let value: Data
+    var modifiedAt: Date? = nil
     var key: String { entity + "/" + field }
 }
 struct SyncChange: Codable, Equatable, Sendable, Identifiable {
@@ -76,6 +77,7 @@ struct SyncChange: Codable, Equatable, Sendable, Identifiable {
     var writes: [SyncWrite]
     var events: [TodoEvent] = []
     var assignments: [SyncAssignment] = []
+    var endedEdits: [UUID]? = nil
 }
 struct SyncAssignment: Codable, Equatable, Sendable, Identifiable {
     let id: UUID
@@ -85,10 +87,19 @@ struct SyncAssignment: Codable, Equatable, Sendable, Identifiable {
 struct SyncLife: Codable, Equatable, Sendable {
     let status: String
     let date: Date?
+    var generation: SyncGeneration? = nil
+    var retired: [String: Int]? = nil
+    var transition: SyncGeneration? = nil
+    var observed: [String: Int]? = nil
+}
+struct SyncGeneration: Codable, Equatable, Sendable {
+    let writer: UUID
+    let counter: Int
 }
 struct SyncMembership: Codable, Equatable, Sendable {
     let projectID: UUID?
     let generation: UUID?
+    var generationDot: SyncGeneration? = nil
 }
 struct SyncIdentity: Codable, Equatable, Sendable {
     let id: UUID
@@ -107,7 +118,7 @@ struct SyncPacket: Codable, Sendable {
     let previous: String
     let changes: [SyncChange]
 }
-struct SyncLibrary: Codable, Sendable { var version = 1; let id: UUID }
+struct SyncLibrary: Codable, Sendable { var version = 3; let id: UUID }
 struct SyncHead: Codable, Sendable {
     var version = 1
     let libraryID: UUID
@@ -130,6 +141,7 @@ struct SyncState: Codable, Sendable {
     var proposedLibraryID: UUID?
     var connection: SyncConnection?
     var remoteCreationMode: DAVCreationMode?
+    var remoteSafetyVersion: Int?
     var enabled = false
     var changes: [SyncChange] = []
     var published: Set<UUID> = []
@@ -140,5 +152,101 @@ struct SyncState: Codable, Sendable {
     var outgoing = SyncCursor()
     var pending: Data?
     var lastSuccess: Date?
-    var pendingCount: Int { outboxIDs.count }
+    var current: CurrentSyncState?
+    var pendingCount: Int { current.map { Set($0.outbox.keys).union($0.flights.keys).count } ?? outboxIDs.count }
+}
+
+/// Protocol v3 stores latest business state and bounded, recoverable in-flight work.
+struct CurrentSyncState: Codable, Sendable {
+    var protocolVersion: Int? = 3
+    var counters: [String: Int] = [:]
+    var outbox: [String: SyncMutation] = [:]
+    var flights: [String: SyncMutation] = [:]
+    var seen: [String: Int] = [:]
+    var acknowledged: [String: Int] = [:]
+    var indexWatermarks: [String: Int] = [:]
+    var inbox: [String: SyncEntityRecord] = [:]
+    var indexEstablished = false
+    var cleanupPending: Bool? = false
+    mutating func enqueue(_ change: SyncChange, writer: UUID) throws {
+        let entities = Set(change.writes.map(\.entity)).union(change.events.map { SyncGraph.entity("todo", $0.itemID) })
+            .union(change.assignments.map { SyncGraph.entity("todo", $0.itemID) })
+        for entity in entities {
+            guard SyncCurrent.validEntity(entity), counters[entity, default: 0] < Int.max else { throw SyncFailure.invalidData }
+            let item = UUID(uuidString: String(entity.split(separator: ":").last!))!
+            var part = change
+            part.writes = try change.writes.filter { $0.entity == entity }.map { write in
+                var value = write; value.modifiedAt = try SyncCurrent.timestamp(write, in: change); return value
+            }
+            part.events = change.events.filter { $0.itemID == item && [.completed, .abandoned].contains($0.kind) }
+            part.assignments = change.assignments.filter { $0.itemID == item }
+            counters[entity, default: 0] += 1
+            let merged = try SyncCurrent.coalescing(part, into: outbox[entity]?.change)
+            outbox[entity] = SyncMutation(entity: entity, writerID: writer, sequence: counters[entity]!, change: merged)
+        }
+    }
+}
+struct SyncMutation: Codable, Sendable {
+    var id = UUID()
+    let entity: String
+    let writerID: UUID
+    var sequence: Int
+    var change: SyncChange
+}
+extension SyncMutation {
+    enum CodingKeys: String, CodingKey { case id, entity, writerID, sequence, change }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        entity = try values.decode(String.self, forKey: .entity)
+        writerID = try values.decode(UUID.self, forKey: .writerID)
+        sequence = try values.decode(Int.self, forKey: .sequence)
+        change = try values.decode(SyncChange.self, forKey: .change)
+    }
+}
+struct SyncEntityRecord: Codable, Sendable {
+    var version = 3
+    let libraryID: UUID
+    let entity: String
+    var revision: Int = 0
+    var change: SyncChange
+    // One acknowledgement per writer, independent of the number of edits/sync rounds.
+    var receipts: [String: Int] = [:]
+    var receiptOperations: [String: SyncReceipt]? = [:]
+    var publication: SyncPublication?
+}
+struct SyncPublication: Codable, Sendable {
+    let writerID: UUID
+    let receipt: SyncReceipt
+}
+struct SyncReceipt: Codable, Equatable, Sendable {
+    let sequence: Int
+    let operationID: UUID
+    let digest: String
+}
+struct SyncCurrentIndex: Codable, Sendable {
+    var version = 3
+    let libraryID: UUID
+    var records: [String: Int] = [:]
+}
+
+enum SyncCurrent {
+    static let maxRecordBytes = 8 * 1024 * 1024
+    static let maxIndexBytes = 4 * 1024 * 1024
+    static func validEntity(_ entity: String) -> Bool {
+        let parts = entity.split(separator: ":")
+        return parts.count == 2 && ["todo", "project"].contains(String(parts[0])) &&
+            UUID(uuidString: String(parts[1]))?.uuidString.lowercased() == String(parts[1])
+    }
+    static func path(_ entity: String) throws -> String {
+        guard validEntity(entity) else { throw SyncFailure.invalidData }
+        return "records/" + entity.replacingOccurrences(of: ":", with: "-") + ".json"
+    }
+    static func encoded<T: Encodable>(_ value: T, limit: Int) throws -> Data {
+        let bytes = try SyncCodec.wrap(value)
+        guard bytes.count <= limit else {
+            throw SyncFailure.configuration("单条同步记录或索引超过体积上限，本地完整内容与待发修改已保留。")
+        }
+        return bytes
+    }
 }

@@ -59,10 +59,13 @@ actor WebDAVClient: DAVTransport {
     private let session: URLSession
     private let collections: [URL]
     private var creationMode: DAVCreationMode?
-    init(connection: SyncConnection, password: String, configuration: URLSessionConfiguration = .ephemeral, creationMode: DAVCreationMode? = nil) throws {
+    private let installationID: UUID
+    private var creating = false
+    init(connection: SyncConnection, password: String, configuration: URLSessionConfiguration = .ephemeral, creationMode: DAVCreationMode? = nil, installationID: UUID = UUID()) throws {
         root = try connection.root
         collections = try connection.collectionURLs
         self.creationMode = creationMode
+        self.installationID = installationID
         guard !password.isEmpty else { throw SyncFailure.configuration("请输入坚果云的应用授权密码。") }
         authorization = "Basic " + Data((connection.username + ":" + password).utf8).base64EncodedString()
         let config = configuration
@@ -72,7 +75,8 @@ actor WebDAVClient: DAVTransport {
     }
     @discardableResult
     func probe() async throws -> DAVCreationMode {
-        let mode = try await DAVProbe.verify(self)
+        try await directory("_work")
+        let mode = try await DAVProbe.verify(self, prefix: "_work/" + installationID.uuidString.lowercased() + ".probe", owner: installationID)
         creationMode = mode
         return mode
     }
@@ -84,10 +88,14 @@ actor WebDAVClient: DAVTransport {
     }
 
     func create(_ path: String, data: Data) async throws {
+        guard !creating else { throw SyncFailure.configuration("同一设备正在创建同步文件，请稍后重试。") }
+        creating = true; defer { creating = false }
         if creationMode == nil { try await probe() }
         switch creationMode! {
         case .conditionalPut: try await DAVProbe.conditionalCreate(self, path: path, data: data)
-        case .exclusiveMove: try await DAVProbe.moveCreate(self, path: path, data: data)
+        case .exclusiveMove:
+            try await directory("_work")
+            try await DAVProbe.moveCreate(self, path: path, data: data, staging: SyncWorkFile(owner: installationID, data: data, kind: .payload).path)
         }
     }
     /// Only configured descendants of the server endpoint are created; never the account root itself.
@@ -208,6 +216,56 @@ extension DAVTransport {
     }
     @discardableResult
     func probe() async throws -> DAVCreationMode { try await DAVProbe.verify(self) }
+    /// Call only after business publication and index confirmation, or for a verified disposable upload.
+    /// Content-addressed URLs are never reused for different bytes, so DELETE need not implement CAS.
+    @discardableResult
+    func deleteWorkFile(_ path: String, response: DAVResponse) async throws -> Bool {
+        guard let file = SyncWorkFile(path: path) else { throw SyncFailure.invalidData }
+        if response.status == 404 { return true }
+        guard response.status == 200 else { throw SyncFailure.http(response.status) }
+        try file.validate(response.data)
+        return try await deleteDisposable(path, response: response)
+    }
+    @discardableResult
+    func deleteProbe(_ path: String, response: DAVResponse) async throws -> Bool {
+        if response.status == 404 { return true }
+        guard response.status == 200 else { throw SyncFailure.http(response.status) }
+        let marker = try SyncCodec.decode(SyncProbeMarker.self, response.data)
+        guard marker.kind == "pindo-probe-v3", ["a", "b", "c"].contains(where: {
+            path == "_work/" + marker.owner.uuidString.lowercased() + ".probe-" + $0 + ".json"
+        }) else { throw SyncFailure.invalidData }
+        // Pure capability probes contain no business input, even if another probe replaces them.
+        return try await deleteDisposable(path, response: response)
+    }
+    private func deleteDisposable(_ path: String, response: DAVResponse) async throws -> Bool {
+        let current = try await get(path)
+        if current.status == 404 { return true }
+        guard current.status == 200 else { throw SyncFailure.http(current.status) }
+        guard current.data == response.data else { return false }
+        do {
+            let headers = DAVProbe.usableTag(current.etag).map { ["If-Match": $0] } ?? [:]
+            let removed = try await request("DELETE", path: path, body: nil, headers: headers)
+            if [409, 412].contains(removed.status) { return false }
+            guard [200, 204, 404].contains(removed.status) else { throw SyncFailure.http(removed.status) }
+        } catch {
+            if let check = try? await get(path), check.status == 404 { return true }
+            throw error
+        }
+        let check = try await get(path)
+        if check.status == 404 { return true }
+        guard check.status == 200 else { throw SyncFailure.http(check.status) }
+        if check.data != response.data { return false }
+        throw SyncFailure.configuration("工作文件删除尚未确认，将保留待清理状态并自动重试。")
+    }
+
+}
+
+struct SyncProbeMarker: Codable, Sendable {
+    var kind = "pindo-probe-v3"
+    let owner: UUID
+    let nonce: UUID
+    let phase: String
+    let createdAt: Date
 }
 
 /// Checks actual version semantics with two real, successive tags, not a fabricated tag format.
@@ -221,10 +279,13 @@ enum DAVProbe {
     private static func failure(_ stage: String, _ detail: String, _ status: Int? = nil) -> SyncFailure {
         .serverCapability(stage: stage, detail: detail, status: status)
     }
-    static func verify(_ dav: any DAVTransport) async throws -> DAVCreationMode {
-        let prefix = "probe-" + UUID().uuidString.lowercased()
+    static func verify(_ dav: any DAVTransport, prefix supplied: String? = nil, owner: UUID = UUID()) async throws -> DAVCreationMode {
+        let prefix = supplied ?? "_work/" + owner.uuidString.lowercased() + ".probe"
         let path = prefix + "-a.json", source = prefix + "-b.json", target = prefix + "-c.json"
-        let a = try SyncCodec.encode(prefix + ":a"), b = try SyncCodec.encode(prefix + ":b"), c = try SyncCodec.encode(prefix + ":c")
+        let nonce = UUID(), now = Date.now
+        let a = try SyncCodec.encode(SyncProbeMarker(owner: owner, nonce: nonce, phase: "a", createdAt: now))
+        let b = try SyncCodec.encode(SyncProbeMarker(owner: owner, nonce: nonce, phase: "b", createdAt: now))
+        let c = try SyncCodec.encode(SyncProbeMarker(owner: owner, nonce: nonce, phase: "c", createdAt: now))
         do {
             let first = try await dav.request("PUT", path: path, body: a, headers: [:])
             guard [200, 201, 204].contains(first.status) else { throw SyncFailure.http(first.status) }
@@ -267,7 +328,7 @@ enum DAVProbe {
                 }
                 mode = .exclusiveMove
             }
-            await cleanup(dav, paths: [path, source, target], known: [a, b, c])
+            try await cleanupConfirmed(dav, paths: [path, source, target], known: [a, b, c])
             return mode
         } catch {
             await cleanup(dav, paths: [path, source, target], known: [a, b, c])
@@ -280,13 +341,13 @@ enum DAVProbe {
         let verified = try await dav.get(path)
         guard verified.status == 200, verified.data == data else { throw SyncFailure.identityCollision }
     }
-    static func moveCreate(_ dav: any DAVTransport, path: String, data: Data) async throws {
-        let pieces = path.split(separator: "/").dropLast().map(String.init)
-        let name = "pindo-upload-" + SyncCodec.hash(Data(path.utf8) + Data([0]) + data) + ".json"
-        let staging = (pieces + [name]).joined(separator: "/") // Stable across retry/crash; never a business key.
+    static func moveCreate(_ dav: any DAVTransport, path: String, data: Data, staging supplied: String? = nil) async throws {
+        let staging = supplied ?? SyncWorkFile(owner: UUID(uuid: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)), data: data, kind: .payload).path
+        guard let work = SyncWorkFile(path: staging), work.kind == .payload else { throw SyncFailure.invalidData }
+        try work.validate(data)
         let existing = try await dav.get(path)
         if existing.status == 200 {
-            await cleanup(dav, paths: [staging], known: [data])
+            try await cleanupConfirmed(dav, paths: [staging], known: [data])
             guard existing.data == data else { throw SyncFailure.identityCollision }
             return
         }
@@ -301,22 +362,33 @@ enum DAVProbe {
             let final = try await dav.get(path)
             guard final.status == 200 else { throw SyncFailure.http(moved.status == 201 ? final.status : moved.status) }
             guard final.data == data else { throw SyncFailure.identityCollision }
-            await cleanup(dav, paths: [staging], known: [data])
+            try await cleanupConfirmed(dav, paths: [staging], known: [data])
         } catch {
             // MOVE may have committed before its response was lost.
             let final = try? await dav.get(path)
             await cleanup(dav, paths: [staging], known: [data])
-            if final?.status == 200 && final?.data == data { return }
+            if final?.status == 200 && final?.data == data { try await cleanupConfirmed(dav, paths: [staging], known: [data]); return }
             throw error
+        }
+    }
+    private static func cleanupConfirmed(_ dav: any DAVTransport, paths: [String], known: [Data]) async throws {
+        for path in paths {
+            let current = try await dav.get(path)
+            if current.status == 404 { continue }
+            guard current.status == 200 else { throw SyncFailure.http(current.status) }
+            if known.contains(current.data) {
+                let removed: Bool
+                if SyncWorkFile(path: path) != nil { removed = try await dav.deleteWorkFile(path, response: current) }
+                else { removed = try await dav.deleteProbe(path, response: current) }
+                guard removed else { throw SyncFailure.configuration("工作文件已变化，保留新内容并稍后重试清理。") }
+            }
         }
     }
     private static func cleanup(_ dav: any DAVTransport, paths: [String], known: [Data]) async {
         for path in paths {
             if let response = try? await dav.get(path), response.status == 200, known.contains(response.data) {
-                // Only nonce-owned probes or deterministic, non-authoritative staging keys reach here.
-                // A missing tag must not leave a failed probe behind; business paths are never cleaned.
-                let headers = usableTag(response.etag).map { ["If-Match": $0] } ?? [:]
-                _ = try? await dav.request("DELETE", path: path, body: nil, headers: headers)
+                if SyncWorkFile(path: path) != nil { _ = try? await dav.deleteWorkFile(path, response: response) }
+                else { _ = try? await dav.deleteProbe(path, response: response) }
             }
         }
     }

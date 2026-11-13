@@ -23,21 +23,23 @@ final class BootstrapDAVServer: @unchecked Sendable {
     private var files: [String: Data] = [:]
     private var denied = false
     private var puts = 0
-    private var ignoreCreateCondition = false, ignoreMatch = false, ignoreMoveGuard = false, missingTag = false
+    private var ignoreCreateCondition = false, ignoreMatch = false, ignoreMoveGuard = false, missingTag = false, unsafeDelete = false
     private var bareTag = false
     private var failMovedDestination: String?
     private var competingMove: (path: String, data: Data)?
-    func reset(denied: Bool = false, nutstore: Bool = false, unsafeMatch: Bool = false, unsafeMove: Bool = false, missingTag: Bool = false) {
+    func reset(denied: Bool = false, nutstore: Bool = false, unsafeMatch: Bool = false, unsafeMove: Bool = false, missingTag: Bool = false, unsafeDelete: Bool = false) {
         lock.withLock {
             directories = ["/dav"]; files = [:]; self.denied = denied; puts = 0
             ignoreCreateCondition = nutstore; bareTag = nutstore; ignoreMatch = unsafeMatch
             ignoreMoveGuard = unsafeMove; self.missingTag = missingTag; failMovedDestination = nil; competingMove = nil
+            self.unsafeDelete = unsafeDelete
         }
     }
     func failMoveOnce(to path: String) { lock.withLock { failMovedDestination = path } }
     func insertCompetitorOnMove(path: String, data: Data) { lock.withLock { competingMove = (path, data) } }
     var filePaths: [String] { lock.withLock { files.keys.sorted() } }
     func remove(_ path: String) { lock.withLock { files.removeValue(forKey: path) } }
+    func clearFiles() { lock.withLock { files = [:] } }
     func insertFile(_ path: String) { lock.withLock { files[path] = Data("occupied".utf8) } }
     var putCount: Int { lock.withLock { puts } }
     func respond(_ request: URLRequest) throws -> (status: Int, data: Data, headers: [String: String]) {
@@ -67,7 +69,7 @@ final class BootstrapDAVServer: @unchecked Sendable {
             let old = files[path]
             if method == "GET" { return result(old == nil ? 404 : 200, old ?? Data()) }
             if !ignoreCreateCondition, request.value(forHTTPHeaderField: "If-None-Match") == "*", old != nil { return result(412) }
-            if !ignoreMatch, let expected = request.value(forHTTPHeaderField: "If-Match"), expected != old.map(tag) { return result(412) }
+            if !ignoreMatch && !(method == "DELETE" && unsafeDelete), let expected = request.value(forHTTPHeaderField: "If-Match"), expected != old.map(tag) { return result(412) }
             if method == "MOVE" {
                 guard let destination = request.value(forHTTPHeaderField: "Destination").flatMap(URL.init(string:)), destination.host == request.url!.host else { return result(400) }
                 let target = "/" + destination.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -102,11 +104,29 @@ actor MemoryDAV: DAVTransport {
     var files: [String: Data] = [:]
     var directories: Set<String> = [""]
     var failAfterPUT: String?
+    var failBeforePUT: String?
     var ignoresConditions = false
+    var puts = 0
+    var concurrentPUT: (String, Data)?
+    var beforePUT: (String, @MainActor @Sendable () throws -> Void)?
+    var concurrentDelete: (String, Data)?
+    var failedDelete: String?
+    var deniedDelete = false
+    var ignoresDeleteCondition = false
+    func setUnsafeDelete() { ignoresDeleteCondition = true }
+    func replaceBeforeDelete(_ path: String, _ bytes: Data) { concurrentDelete = (path, bytes) }
+    func loseDeleteResponse(_ path: String) { failedDelete = path }
+    func denyDeletes(_ value: Bool) { deniedDelete = value }
+    func insertBeforePUT(_ path: String, _ bytes: Data) { concurrentPUT = (path, bytes) }
+    func performBeforePUT(_ path: String, _ action: @escaping @MainActor @Sendable () throws -> Void) { beforePUT = (path, action) }
     func setFailure(_ path: String) { failAfterPUT = path }
+    func setBeforeFailure(_ path: String) { failBeforePUT = path }
     func setUnsafe() { ignoresConditions = true }
     func overwrite(_ path: String, _ data: Data) { files[path] = data }
     func request(_ method: String, path: String, body: Data?, headers: [String: String]) async throws -> DAVResponse {
+        if method == "PUT", let callback = beforePUT, callback.0 == path { beforePUT = nil; try await callback.1() }
+        if method == "PUT", let value = concurrentPUT, value.0 == path { files[path] = value.1; concurrentPUT = nil }
+        if method == "DELETE", let value = concurrentDelete, value.0 == path { files[path] = value.1; concurrentDelete = nil }
         let old = files[path]
         let tag = old.map { "\"" + SyncCodec.hash($0) + "\"" }
         if method == "GET" { return DAVResponse(data: old ?? Data(), status: old == nil ? 404 : 200, etag: tag) }
@@ -117,14 +137,21 @@ actor MemoryDAV: DAVTransport {
         if method == "MKCOL" { return DAVResponse(data: Data(), status: directories.insert(path).inserted ? 201 : 405, etag: nil) }
         if !ignoresConditions {
             if headers["If-None-Match"] == "*", old != nil { return DAVResponse(data: Data(), status: 412, etag: tag) }
-            if let expected = headers["If-Match"], tag != expected { return DAVResponse(data: Data(), status: 412, etag: tag) }
+            if !(method == "DELETE" && ignoresDeleteCondition), let expected = headers["If-Match"], tag != expected { return DAVResponse(data: Data(), status: 412, etag: tag) }
         }
         if method == "PUT", let body {
+            if failBeforePUT == path { failBeforePUT = nil; throw URLError(.timedOut) }
+            puts += 1
             files[path] = body
             if failAfterPUT == path { failAfterPUT = nil; throw URLError(.timedOut) }
             return DAVResponse(data: Data(), status: old == nil ? 201 : 204, etag: "\"" + SyncCodec.hash(body) + "\"")
         }
-        if method == "DELETE" { files.removeValue(forKey: path); return DAVResponse(data: Data(), status: 204, etag: nil) }
+        if method == "DELETE" {
+            if deniedDelete { return DAVResponse(data: Data(), status: 403, etag: tag) }
+            files.removeValue(forKey: path)
+            if failedDelete == path { failedDelete = nil; throw URLError(.timedOut) }
+            return DAVResponse(data: Data(), status: 204, etag: nil)
+        }
         throw SyncFailure.http(500)
     }
     func children(_ path: String) async throws -> [String] {
@@ -136,6 +163,332 @@ actor MemoryDAV: DAVTransport {
 
 final class SyncTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
+    @MainActor
+    func testCurrentFilesRemainConstantAcrossEditsAndIdleRefreshes() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-current-growth-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.9.0")
+        var item = TodoItem(title: "最新状态", notes: "最初正文", createdAt: now)
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        try store.initializeSync()
+        let sync = SyncCoordinator(), dav = MemoryDAV(); sync.attach(store)
+        _ = try await sync.exchange(using: dav)
+        let initialFiles = await dav.files.keys.sorted()
+        for index in 0..<30 {
+            item = try XCTUnwrap(store.storedItem(item.id)); item.notes = "仅保留第 \(index) 次正文"
+            try store.commit(item, event: TodoEvent(itemID: item.id, kind: .edited, occurredAt: now), clearDraft: true)
+            _ = try await sync.exchange(using: dav)
+        }
+        let afterFiles = await dav.files.keys.sorted(), count = await dav.puts
+        XCTAssertEqual(initialFiles, afterFiles); XCTAssertEqual(afterFiles.count, 3)
+        for _ in 0..<5 { _ = try await sync.exchange(using: dav) }
+        let idlePuts = await dav.puts; XCTAssertEqual(idlePuts, count)
+        let response = try await dav.get(SyncCurrent.path(SyncGraph.entity("todo", item.id)))
+        let record = try SyncCodec.unwrap(SyncEntityRecord.self, response.data)
+        let notes = record.change.writes.filter { $0.field == "notes" }
+        XCTAssertEqual(notes.count, 1)
+        XCTAssertEqual(try SyncCodec.decode(String.self, notes[0].value), item.notes)
+        XCTAssertEqual(record.receipts.count, 1)
+        XCTAssertTrue(try store.syncState()!.current!.flights.isEmpty)
+        XCTAssertEqual(try store.syncState()!.changes.flatMap(\.writes).filter { $0.field == "notes" }.count, 1)
+        _ = try BackupCodec.decode(BackupCodec.encode(store.archive()))
+    }
+    @MainActor
+    func testOfflineRepeatedEditsCoalesceLatestBodyAndPersistAcrossReopen() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-offline-compact-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        var store: TodoRepository? = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.9.0")
+        var item = TodoItem(title: "离线正文", createdAt: now)
+        try store!.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        try store!.initializeSync()
+        for index in 0..<100 {
+            item = try XCTUnwrap(store!.storedItem(item.id)); item.notes = "第 \(index) 次 " + String(repeating: "长备注", count: 100)
+            try store!.commit(item, event: TodoEvent(itemID: item.id, kind: .edited, occurredAt: now), clearDraft: true)
+        }
+        XCTAssertEqual(try store!.syncState()!.pendingCount, 1)
+        XCTAssertEqual(try store!.syncState()!.current!.outbox.values.flatMap { $0.change.writes }.filter { $0.field == "notes" }.count, 1)
+        store = nil
+        store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.9.0")
+        let sync = SyncCoordinator(), dav = MemoryDAV(); sync.attach(store!)
+        _ = try await sync.exchange(using: dav)
+        XCTAssertEqual(try store!.storedItem(item.id)?.notes, item.notes)
+        XCTAssertEqual(try store!.syncState()!.pendingCount, 0)
+        store = nil
+    }
+    @MainActor
+    func testIndexFailureRetainsFlightAndRetriesWithoutNewRecordRevision() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-current-index-retry-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.9.0")
+        try store.initializeSync()
+        let sync = SyncCoordinator(), dav = MemoryDAV(); sync.attach(store)
+        _ = try await sync.exchange(using: dav)
+        let item = TodoItem(title: "记录已写入但索引尚未发布", createdAt: now)
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        await dav.setBeforeFailure("index.json")
+        do { _ = try await sync.exchange(using: dav); XCTFail("Expected interruption") } catch { }
+        XCTAssertEqual(try store.syncState()!.current!.flights.count, 1)
+        let path = try SyncCurrent.path(SyncGraph.entity("todo", item.id))
+        let before = try await dav.get(path)
+        let revision = try SyncCodec.unwrap(SyncEntityRecord.self, before.data).revision
+        _ = try await sync.exchange(using: dav)
+        let after = try await dav.get(path)
+        XCTAssertEqual(try SyncCodec.unwrap(SyncEntityRecord.self, after.data).revision, revision)
+        XCTAssertEqual(try store.syncState()!.pendingCount, 0)
+    }
+    @MainActor
+    func testEditingWhileRequestIsInFlightPreservesNewestUnsentBody() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-current-inflight-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.9.0")
+        var item = TodoItem(title: "请求在途", notes: "初始", createdAt: now)
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        try store.initializeSync()
+        let sync = SyncCoordinator(), dav = MemoryDAV(); sync.attach(store)
+        _ = try await sync.exchange(using: dav)
+        item = try XCTUnwrap(store.storedItem(item.id)); item.notes = "已封存发送中的正文"
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .edited, occurredAt: now), clearDraft: true)
+        let id = item.id, stamp = now, path = try SyncCurrent.path(SyncGraph.entity("todo", item.id))
+        await dav.performBeforePUT(path) {
+            for value in ["在途期间第一次修改", "在途期间最终正文"] {
+                var latest = try XCTUnwrap(store.storedItem(id)); latest.notes = value
+                try store.commit(latest, event: TodoEvent(itemID: id, kind: .edited, occurredAt: stamp), clearDraft: true)
+            }
+        }
+        _ = try await sync.exchange(using: dav)
+        XCTAssertEqual(try store.storedItem(id)?.notes, "在途期间最终正文")
+        XCTAssertEqual(try store.syncState()!.pendingCount, 1)
+        _ = try await sync.exchange(using: dav)
+        XCTAssertEqual(try store.syncState()!.pendingCount, 0)
+        XCTAssertTrue(try SyncGraph(store.syncState()!.changes).conflicts().isEmpty)
+        let remote = try await dav.get(path)
+        let value = try SyncCodec.unwrap(SyncEntityRecord.self, remote.data)
+        XCTAssertEqual(try SyncCodec.decode(String.self, XCTUnwrap(value.change.writes.first { $0.field == "notes" }).value), "在途期间最终正文")
+    }
+    @MainActor
+    func testConditionalRecordRaceMergesBothCandidatesAndResolutionRemovesOldBodies() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-current-cas-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.9.0")
+        var item = TodoItem(title: "共同起点", createdAt: now)
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        try store.initializeSync()
+        let sync = SyncCoordinator(), dav = MemoryDAV(); sync.attach(store)
+        _ = try await sync.exchange(using: dav)
+        let entity = SyncGraph.entity("todo", item.id), path = try SyncCurrent.path(entity)
+        let before = try await dav.get(path), state = try XCTUnwrap(store.syncState())
+        let base = try SyncCodec.unwrap(SyncEntityRecord.self, before.data)
+        var other = item; other.title = "另一端正文"
+        let rivalChange = try edit(state, original: item, updated: other)
+        let rival = try SyncCurrent.merging(SyncMutation(entity: entity, writerID: UUID(), sequence: 1, change: rivalChange), into: base)
+        item.title = "本机正文"
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .edited, occurredAt: now), clearDraft: true)
+        await dav.insertBeforePUT(path, try SyncCodec.wrap(rival))
+        _ = try await sync.exchange(using: dav)
+        let conflict = try XCTUnwrap(SyncGraph(store.syncState()!.changes).conflicts().first { $0.field == "title" })
+        XCTAssertEqual(conflict.candidates.count, 2)
+        let chosen = try XCTUnwrap(conflict.candidates.first { (try? SyncCodec.decode(String.self, $0.value)) == "本机正文" })
+        try store.resolveSyncConflict(conflict, candidate: chosen)
+        _ = try await sync.exchange(using: dav)
+        let response = try await dav.get(path), final = try SyncCodec.unwrap(SyncEntityRecord.self, response.data)
+        XCTAssertEqual(final.change.writes.filter { $0.field == "title" }.count, 1)
+        XCTAssertTrue(try SyncGraph(store.syncState()!.changes).conflicts().isEmpty)
+        XCTAssertEqual(try store.storedItem(item.id)?.title, "本机正文")
+    }
+    @MainActor
+    func testNewDeviceReadsOnlyLatestFilesAndKeepsCompletedAndAbandonedHistory() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-current-join-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let a = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("a")), appVersion: "0.9.0")
+        let b = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("b")), appVersion: "0.9.0")
+        let project = try a.createProject(name: "业务历史")
+        var completed = TodoItem(title: "已完成事项", projectID: project.id, createdAt: now)
+        var abandoned = TodoItem(title: "已放弃事项", projectID: project.id, createdAt: now)
+        for item in [completed, abandoned] { try a.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true) }
+        try a.initializeSync(); try b.initializeSync()
+        completed.status = .completed; completed.completedAt = now
+        abandoned.status = .abandoned; abandoned.abandonedAt = now
+        try a.commit(completed, event: TodoEvent(itemID: completed.id, kind: .completed, occurredAt: now), clearDraft: true)
+        try a.commit(abandoned, event: TodoEvent(itemID: abandoned.id, kind: .abandoned, occurredAt: now), clearDraft: true)
+        _ = try a.archiveProject(id: project.id); _ = try a.restoreProject(id: project.id)
+        let ca = SyncCoordinator(), cb = SyncCoordinator(), dav = MemoryDAV(); ca.attach(a); cb.attach(b)
+        _ = try await ca.exchange(using: dav); _ = try await cb.exchange(using: dav)
+        XCTAssertEqual(try a.syncContents().items.sorted { $0.id.uuidString < $1.id.uuidString }, try b.syncContents().items.sorted { $0.id.uuidString < $1.id.uuidString })
+        XCTAssertEqual(try b.storedItem(completed.id)?.projectID, project.id)
+        XCTAssertEqual(try b.storedItem(abandoned.id)?.status, .abandoned)
+        let files = await dav.files.keys.sorted(); XCTAssertEqual(files.count, 5)
+        XCTAssertFalse(files.contains { $0.contains("writers/") || $0.contains("segments/") })
+        _ = try BackupCodec.decode(BackupCodec.encode(b.archive()))
+    }
+    func testRecordSizeLimitRejectsWithoutTruncatingAndInvalidPathsFail() throws {
+        let original = String(repeating: "内容", count: 1000)
+        XCTAssertThrowsError(try SyncCurrent.encoded(original, limit: 64))
+        XCTAssertEqual(original.count, 2000)
+        for value in ["../other", "todo:bad", "unknown:" + UUID().uuidString.lowercased()] { XCTAssertThrowsError(try SyncCurrent.path(value)) }
+    }
+    @MainActor
+    func testCurrentInitializationPreservesRealPastBusinessDates() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-current-dates-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.9.0")
+        let past = Date(timeIntervalSince1970: 1_600_000_000)
+        let item = TodoItem(title: "旧事项时间", createdAt: past)
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: past), clearDraft: true)
+        let before = try XCTUnwrap(store.storedItem(item.id))
+        try store.initializeSync()
+        XCTAssertEqual(try store.storedItem(item.id)?.updatedAt, before.updatedAt)
+        let sync = SyncCoordinator(), dav = MemoryDAV(); sync.attach(store)
+        _ = try await sync.exchange(using: dav)
+        XCTAssertEqual(try store.storedItem(item.id)?.updatedAt, before.updatedAt)
+        _ = try BackupCodec.decode(BackupCodec.encode(store.archive()))
+    }
+    @MainActor
+    func testLocalTransportResetPreservesBusinessAndPreparesFreshUpload() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-current-local-reset-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.9.0")
+        let item = TodoItem(title: "本地完整内容保留", notes: "保留正文", createdAt: Date(timeIntervalSince1970: 1_600_000_000))
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: item.createdAt), clearDraft: true)
+        try store.initializeSync()
+        let before = try store.syncContents()
+        var old = try XCTUnwrap(store.syncState())
+        old.current = nil; old.libraryID = UUID(); old.outgoing = SyncCursor(sequence: 100, checksum: "obsolete")
+        old.published = Set((0..<100).map { _ in UUID() })
+        try store.saveSyncState(old)
+        try store.prepareCurrentSync()
+        let new = try XCTUnwrap(store.syncState())
+        XCTAssertNil(new.libraryID); XCTAssertTrue(new.published.isEmpty); XCTAssertNil(new.pending)
+        XCTAssertEqual(new.pendingCount, 1)
+        XCTAssertEqual(try store.syncContents().items, before.items)
+        XCTAssertEqual(try store.syncContents().events, before.events)
+        _ = try BackupCodec.decode(BackupCodec.encode(store.archive()))
+    }
+    @MainActor
+    func testCurrentIndexCannotSilentlyForgetAnAcknowledgedEntity() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-current-index-loss-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.9.0")
+        let item = TodoItem(title: "不能被残缺索引遗漏", createdAt: now)
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        try store.initializeSync()
+        let sync = SyncCoordinator(), dav = MemoryDAV(); sync.attach(store)
+        _ = try await sync.exchange(using: dav)
+        let state = try XCTUnwrap(store.syncState())
+        await dav.overwrite("index.json", try SyncCodec.wrap(SyncCurrentIndex(libraryID: state.libraryID!)))
+        do { _ = try await sync.exchange(using: dav); XCTFail("Incomplete index accepted") }
+        catch { guard case SyncFailure.incompleteListing = error else { return XCTFail("Unexpected: \(error)") } }
+        XCTAssertEqual(try store.storedItem(item.id)?.title, item.title)
+        XCTAssertEqual(try store.syncState()?.lastSuccess, state.lastSuccess)
+    }
+    @MainActor
+    func testCurrentReceiptRollbackOrClonedWriterCannotEraseLocalInput() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-current-receipt-loss-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.9.0")
+        var item = TodoItem(title: "本地新正文", createdAt: now)
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        try store.initializeSync()
+        let sync = SyncCoordinator(), dav = MemoryDAV(); sync.attach(store)
+        _ = try await sync.exchange(using: dav)
+        item = try XCTUnwrap(store.storedItem(item.id)); item.notes = "已确认的新内容"
+        try store.commit(item, event: TodoEvent(itemID: item.id, kind: .edited, occurredAt: now), clearDraft: true)
+        _ = try await sync.exchange(using: dav)
+        let state = try XCTUnwrap(store.syncState()), entity = SyncGraph.entity("todo", item.id), path = try SyncCurrent.path(entity)
+        let bytes = try await dav.get(path)
+        let valid = try SyncCodec.unwrap(SyncEntityRecord.self, bytes.data)
+        for receipt in [1, 100] {
+            var broken = valid; broken.revision += receipt
+            broken.receipts[state.writerID.uuidString.lowercased()] = receipt
+            await dav.overwrite(path, try SyncCodec.wrap(broken))
+            var index = SyncCurrentIndex(libraryID: state.libraryID!); index.records[entity] = broken.revision
+            await dav.overwrite("index.json", try SyncCodec.wrap(index))
+            do { _ = try await sync.exchange(using: dav); XCTFail("Writer receipt corruption accepted") }
+            catch { guard case SyncFailure.identityCollision = error else { return XCTFail("Unexpected: \(error)") } }
+            XCTAssertEqual(try store.storedItem(item.id)?.notes, item.notes)
+        }
+    }
+    @MainActor
+    func testMoreThanOneDownloadBudgetJoinsWithoutReplayingOrStalling() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-current-budget-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let a = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("a")), appVersion: "0.9.0")
+        let b = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("b")), appVersion: "0.9.0")
+        let project = try a.createProject(name: "分批同步")
+        for index in 0..<28 {
+            let item = TodoItem(title: "事项 \(index)", projectID: project.id, createdAt: now)
+            try a.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        }
+        try a.initializeSync(); try b.initializeSync()
+        let ca = SyncCoordinator(), cb = SyncCoordinator(), dav = MemoryDAV(); ca.attach(a); cb.attach(b)
+        for _ in 0..<5 { if try await !ca.exchange(using: dav) { break } }
+        for _ in 0..<5 { if try await !cb.exchange(using: dav) { break } }
+        XCTAssertEqual(try b.loadActiveItems().count, 28)
+        XCTAssertEqual(try b.syncState()!.pendingCount, 0)
+        XCTAssertTrue(try b.syncState()!.current!.inbox.isEmpty)
+        let files = await dav.files.keys.count; XCTAssertEqual(files, 31)
+        _ = try BackupCodec.decode(BackupCodec.encode(b.archive()))
+    }
+    @MainActor
+    func testTwoPublishersKeepBothNewEntitiesInCurrentIndex() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-current-index-race-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let a = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("a")), appVersion: "0.9.0")
+        let b = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("b")), appVersion: "0.9.0")
+        try a.initializeSync(); try b.initializeSync()
+        let ca = SyncCoordinator(), cb = SyncCoordinator(), dav = MemoryDAV(); ca.attach(a); cb.attach(b)
+        _ = try await ca.exchange(using: dav); _ = try await cb.exchange(using: dav)
+        for (store, title) in [(a, "Mac 新事项"), (b, "另一端新事项")] {
+            let item = TodoItem(title: title, createdAt: now)
+            try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        }
+        async let first = ca.exchange(using: dav)
+        async let second = cb.exchange(using: dav)
+        _ = try await (first, second)
+        _ = try await ca.exchange(using: dav); _ = try await cb.exchange(using: dav)
+        XCTAssertEqual(try a.loadActiveItems().count, 2); XCTAssertEqual(try b.loadActiveItems().count, 2)
+        let index = try await dav.get("index.json")
+        XCTAssertEqual(try SyncCodec.unwrap(SyncCurrentIndex.self, index.data).records.count, 2)
+    }
+    @MainActor
+    func testCompactCurrentProtocolKeepsIndependentCompletionWhenOtherCompletionIsUndone() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-current-undo-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let a = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("a")), appVersion: "0.9.0")
+        let b = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("b")), appVersion: "0.9.0")
+        let item = TodoItem(title: "独立完成不能被另一端撤回", createdAt: now)
+        try a.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
+        try a.initializeSync(); try b.initializeSync()
+        let ca = SyncCoordinator(), cb = SyncCoordinator(), dav = MemoryDAV(); ca.attach(a); cb.attach(b)
+        _ = try await ca.exchange(using: dav); _ = try await cb.exchange(using: dav)
+        var ended = item; ended.status = .completed; ended.completedAt = now
+        let receiptA = TodoEvent(itemID: item.id, kind: .completed, occurredAt: now)
+        try a.commit(ended, event: receiptA, clearDraft: true)
+        try b.commit(ended, event: TodoEvent(itemID: item.id, kind: .completed, occurredAt: now), clearDraft: true)
+        _ = try await ca.exchange(using: dav)
+        var restored = try XCTUnwrap(a.storedItem(item.id)); restored.status = .active; restored.completedAt = nil
+        try a.commit(restored, event: TodoEvent(itemID: item.id, kind: .completionUndone, occurredAt: now.addingTimeInterval(1), relatedCompletionID: receiptA.id), clearDraft: true)
+        _ = try await cb.exchange(using: dav); _ = try await ca.exchange(using: dav); _ = try await cb.exchange(using: dav)
+        XCTAssertEqual(try a.storedItem(item.id)?.status, .completed)
+        XCTAssertEqual(try b.storedItem(item.id)?.status, .completed)
+    }
+    func testReceiptPreventsLostAcknowledgementFromResurrectingAnOldBody() throws {
+        let item = TodoItem(title: "原值", createdAt: now)
+        var empty = SyncState()
+        let creation = try XCTUnwrap(SyncBuilder.capture(before: SyncContents(items: [], projects: [], events: []), after: SyncContents(items: [item], projects: [], events: []), state: empty))
+        let entity = SyncGraph.entity("todo", item.id), library = UUID(), writer = UUID()
+        var record = SyncEntityRecord(libraryID: library, entity: entity, change: SyncChange(writerID: writer, date: now, writes: []))
+        let first = SyncMutation(entity: entity, writerID: writer, sequence: 1, change: creation)
+        record = try SyncCurrent.merging(first, into: record)
+        empty.changes = [record.change]
+        var changed = item; changed.title = "最终正文"
+        let next = SyncMutation(entity: entity, writerID: UUID(), sequence: 1, change: try edit(empty, original: item, updated: changed))
+        record = try SyncCurrent.merging(next, into: record)
+        let revision = record.revision
+        record = try SyncCurrent.merging(first, into: record)
+        XCTAssertEqual(record.revision, revision)
+        XCTAssertEqual(try SyncGraph([record.change]).projection().items.first?.title, changed.title)
+        XCTAssertEqual(record.change.writes.filter { $0.field == "title" }.count, 1)
+    }
     private func bootstrapClient(directory: String = "PinDo/nested", mode: DAVCreationMode? = nil) throws -> WebDAVClient {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [BootstrapDAVProtocol.self]
@@ -211,7 +564,7 @@ final class SyncTests: XCTestCase {
         XCTAssertFalse(BootstrapDAVProtocol.server.filePaths.contains { $0.contains("pindo-upload-") })
     }
     @MainActor
-    func testNutstoreStyleTwoClientsExchangeAndUpdateExistingHeads() async throws {
+    func testNutstoreStyleTwoClientsExchangeAndUpdateLatestRecords() async throws {
         BootstrapDAVProtocol.server.reset(nutstore: true)
         let client = try bootstrapClient(); try await client.prepareRootHierarchy()
         let mode = try await client.probe()
@@ -235,7 +588,7 @@ final class SyncTests: XCTestCase {
         XCTAssertEqual(try a.storedItem(item.id)?.title, ai.title)
         XCTAssertEqual(try a.storedItem(item.id)?.notes, bi.notes)
         XCTAssertEqual(try a.syncState()?.remoteCreationMode, .exclusiveMove)
-        XCTAssertGreaterThan(try a.syncState()!.outgoing.sequence, 1)
+        XCTAssertGreaterThan(try a.syncState()!.current!.seen[SyncGraph.entity("todo", item.id), default: 0], 1)
         XCTAssertFalse(BootstrapDAVProtocol.server.filePaths.contains { $0.contains("pindo-upload-") || $0.contains("probe-") })
         _ = try BackupCodec.decode(BackupCodec.encode(a.archive()))
     }
@@ -248,7 +601,8 @@ final class SyncTests: XCTestCase {
                 guard case SyncFailure.serverCapability(let stage, _, _) = error else { return XCTFail("No diagnostic: \(error)") }
                 XCTAssertTrue(stage.contains(["旧版本", "禁止覆盖", "ETag"][variant]))
             }
-            XCTAssertTrue(BootstrapDAVProtocol.server.filePaths.isEmpty)
+            if variant == 2 { XCTAssertLessThanOrEqual(BootstrapDAVProtocol.server.filePaths.count, 3) }
+            else { XCTAssertTrue(BootstrapDAVProtocol.server.filePaths.isEmpty) }
         }
     }
     func testOldSyncStateLoadsWithoutCreationCapabilityAndNewStatePersistsIt() throws {
@@ -297,7 +651,7 @@ final class SyncTests: XCTestCase {
         try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
         _ = try await sync.exchange(using: client)
         XCTAssertEqual(try store.syncState()?.pendingCount, 0)
-        XCTAssertEqual(try store.syncState()?.outgoing.sequence, 1)
+        XCTAssertGreaterThan(try store.syncState()!.current!.seen[SyncGraph.entity("todo", item.id), default: 0], 0)
         let second = try TodoRepository(paths: AppPaths(root: root.appendingPathComponent("second")), appVersion: "0.8.0")
         try second.initializeSync()
         let joining = SyncCoordinator(); joining.attach(second)
@@ -305,7 +659,7 @@ final class SyncTests: XCTestCase {
         XCTAssertEqual(try second.loadActiveItems().first?.title, item.title)
     }
     @MainActor
-    func testAlreadyBoundLibraryMissingDoesNotCreateReplacement() async throws {
+    func testClearingCloudReuploadsAllLocalBusinessData() async throws {
         BootstrapDAVProtocol.server.reset()
         let client = try bootstrapClient(); try await client.prepareRootHierarchy()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-missing-library-\(UUID())")
@@ -316,13 +670,14 @@ final class SyncTests: XCTestCase {
         try store.initializeSync()
         let sync = SyncCoordinator(); sync.attach(store)
         _ = try await sync.exchange(using: client)
-        let library = try store.syncState()?.libraryID, count = BootstrapDAVProtocol.server.putCount
-        BootstrapDAVProtocol.server.remove("/dav/PinDo/nested/library.json")
-        do { _ = try await sync.exchange(using: client); XCTFail("Lost library silently recreated") }
-        catch { guard case SyncFailure.wrongLibrary = error else { return XCTFail("Unexpected: \(error)") } }
-        XCTAssertEqual(BootstrapDAVProtocol.server.putCount, count)
-        XCTAssertEqual(try store.syncState()?.libraryID, library)
+        let library = try store.syncState()?.libraryID
+        BootstrapDAVProtocol.server.clearFiles()
+        _ = try await sync.exchange(using: client)
+        XCTAssertNotEqual(try store.syncState()?.libraryID, library)
         XCTAssertEqual(try store.storedItem(item.id)?.title, item.title)
+        XCTAssertEqual(try store.syncState()?.pendingCount, 0)
+        let stored = try await client.get(SyncCurrent.path(SyncGraph.entity("todo", item.id)))
+        XCTAssertEqual(stored.status, 200)
     }
     func testFirstSyncAuthenticationErrorIsNotTreatedAsEmptyDirectory() async throws {
         BootstrapDAVProtocol.server.reset(denied: true)
@@ -517,7 +872,7 @@ final class SyncTests: XCTestCase {
     }
 
     @MainActor
-    func testLostUploadResponseRetriesSamePacketWithoutDuplicatingEvents() async throws {
+    func testLostRecordResponseAcknowledgesWithoutDuplicatingEvents() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-sync-retry-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.6.0")
@@ -525,15 +880,16 @@ final class SyncTests: XCTestCase {
         try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
         try store.initializeSync()
         let coordinator = SyncCoordinator(); coordinator.attach(store)
-        let dav = MemoryDAV(), writer = try XCTUnwrap(store.syncState()).writerID.uuidString.lowercased()
-        await dav.setFailure(SyncCoordinator.packetPath(writer: writer, sequence: 1))
-        do { _ = try await coordinator.exchange(using: dav); XCTFail("Expected interrupted response") } catch {}
-        let pending = try XCTUnwrap(store.syncState()?.pending)
+        let dav = MemoryDAV()
+        let path = try SyncCurrent.path(SyncGraph.entity("todo", item.id))
+        await dav.setFailure(path)
         _ = try await coordinator.exchange(using: dav)
-        XCTAssertNil(try store.syncState()?.pending)
-        XCTAssertEqual(try store.syncState()?.outgoing.checksum, SyncCodec.hash(pending))
-        XCTAssertEqual(try store.syncContents().events.count, 1)
+        _ = try await coordinator.exchange(using: dav)
+        XCTAssertTrue(try store.syncState()!.current!.flights.isEmpty)
+        XCTAssertEqual(try store.syncContents().events.count, 0)
         XCTAssertEqual(try store.syncState()?.pendingCount, 0)
+        let data = try await dav.get(path)
+        XCTAssertEqual(try SyncCodec.unwrap(SyncEntityRecord.self, data.data).revision, 1)
     }
     @MainActor
     func testSyncInitializationSurvivesReopenAndRepairsManifestHandshake() throws {
@@ -593,8 +949,8 @@ final class SyncTests: XCTestCase {
         XCTAssertEqual(result.title, draft.title); XCTAssertEqual(result.notes, remote.notes)
         XCTAssertEqual(result.projectID, q.id); XCTAssertEqual(result.dueAt, remote.dueAt)
         XCTAssertEqual(result.projectAssignments, priorAssignments)
-        let recorded = try XCTUnwrap(store.syncContents().events.first { $0.id == event.id })
-        XCTAssertEqual(recorded.previousDeadline, remote.dueAt); XCTAssertEqual(recorded.newDeadline, remote.dueAt)
+        XCTAssertFalse(try store.syncContents().events.contains { $0.id == event.id })
+        XCTAssertEqual(result.dueAt, remote.dueAt)
     }
     @MainActor
     func testLegacyBackupMergePreservesNewItemsAndCurrentCompletion() throws {
@@ -634,7 +990,7 @@ final class SyncTests: XCTestCase {
         let current = try XCTUnwrap(SyncGraph(store.syncState()!.changes).conflicts().first)
         try store.resolveSyncConflict(current, candidate: current.candidates[0])
         XCTAssertTrue(try SyncGraph(store.syncState()!.changes).conflicts().isEmpty)
-        XCTAssertGreaterThan(try store.syncState()!.outboxIDs.count, 1)
+        XCTAssertFalse(try store.syncState()!.current!.outbox.isEmpty)
         XCTAssertEqual(try store.storedItem(item.id)?.title, try SyncCodec.decode(String.self, current.candidates[0].value))
     }
     func testArchiveAndManualMoveToAnotherProjectConverge() throws {
@@ -714,7 +1070,7 @@ final class SyncTests: XCTestCase {
         }
     }
     @MainActor
-    func testLostHeadResponseRecoversAfterHeadAlreadyAdvanced() async throws {
+    func testLostIndexResponseRecoversWithoutDuplicateRecord() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-head-retry-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.6.0")
@@ -722,15 +1078,15 @@ final class SyncTests: XCTestCase {
         try store.commit(item, event: TodoEvent(itemID: item.id, kind: .created, occurredAt: now), clearDraft: true)
         try store.initializeSync()
         let sync = SyncCoordinator(); sync.attach(store)
-        let dav = MemoryDAV(), writer = try XCTUnwrap(store.syncState()).writerID.uuidString.lowercased()
-        await dav.setFailure("writers/" + writer + "/head.json")
-        do { _ = try await sync.exchange(using: dav); XCTFail("Expected interrupted response") } catch {}
-        XCTAssertNotNil(try store.syncState()?.pending)
+        let dav = MemoryDAV()
+        await dav.setFailure("index.json")
+        do { _ = try await sync.exchange(using: dav) } catch { }
         _ = try await sync.exchange(using: dav)
-        XCTAssertNil(try store.syncState()?.pending)
-        XCTAssertEqual(try store.syncState()?.outgoing.sequence, 1)
-        XCTAssertEqual(try store.syncContents().events.count, 1)
+        XCTAssertTrue(try store.syncState()!.current!.flights.isEmpty)
+        XCTAssertGreaterThan(try store.syncState()!.current!.seen[SyncGraph.entity("todo", item.id), default: 0], 0)
+        XCTAssertEqual(try store.syncContents().events.count, 0)
     }
+
     @MainActor
     func testChangedRemoteLibraryDoesNotOverwriteLocalData() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-library-change-\(UUID())")
@@ -784,7 +1140,7 @@ final class SyncTests: XCTestCase {
     }
 
     @MainActor
-    func testMissingPublishedHeadDoesNotReportSuccessOrRecreateHistory() async throws {
+    func testMissingCurrentIndexDoesNotReportSuccessOrLoseLocalContent() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("pindo-missing-head-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
         let store = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.6.0")
@@ -795,13 +1151,13 @@ final class SyncTests: XCTestCase {
         let dav = MemoryDAV()
         _ = try await sync.exchange(using: dav)
         let state = try XCTUnwrap(store.syncState())
-        let headPath = "writers/" + state.writerID.uuidString.lowercased() + "/head.json"
-        _ = try await dav.request("DELETE", path: headPath, body: nil, headers: [:])
-        do { _ = try await sync.exchange(using: dav); XCTFail("Missing published head accepted") }
-        catch { guard case SyncFailure.incompleteListing = error else { return XCTFail("Unexpected error: \(error)") } }
+        let indexPath = "index.json"
+        _ = try await dav.request("DELETE", path: indexPath, body: nil, headers: [:])
+        do { _ = try await sync.exchange(using: dav); XCTFail("Missing index accepted") }
+        catch { guard case SyncFailure.configuration = error else { return XCTFail("Unexpected error: \(error)") } }
         XCTAssertEqual(try store.syncState()?.lastSuccess, state.lastSuccess)
         XCTAssertEqual(try store.storedItem(item.id)?.title, item.title)
-        let response = try await dav.get(headPath)
+        let response = try await dav.get(indexPath)
         XCTAssertEqual(response.status, 404)
     }
 

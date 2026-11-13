@@ -47,10 +47,10 @@ struct BoardData: Sendable {
 enum UnfinishedProjectAction: Sendable { case transferToUnassigned, abandon }
 
 struct ProjectAssignment: Codable, Equatable, Sendable {
-    enum Reason: String, Codable, Sendable { case manual, archived, deleted, completionRestored }
+    enum Reason: String, Codable, Sendable { case manual, archived, deleted, completionRestored, generationExpired }
     let previousProjectID: UUID?
     let projectID: UUID?
-    let changedAt: Date
+    let changedAt: Date?
     let reason: Reason
 }
 

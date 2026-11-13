@@ -40,6 +40,7 @@ final class AppEnvironment: ObservableObject {
                     try TodoRepository.prepareForOpening(paths: paths, appVersion: version)
                 }.value
                 let repository = TodoRepository(paths: paths, appVersion: version, prepared: prepared)
+                try repository.prepareCompactStorage()
                 let data = try repository.loadBoardData()
                 let board = BoardModel(items: data.items, projects: data.projects, persistence: repository)
                 self.configureScope(board)

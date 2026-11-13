@@ -32,7 +32,7 @@ final class RepositoryTests: XCTestCase {
         repository = try TodoRepository(paths: paths, appVersion: "0.1.0")
         XCTAssertEqual(try repository!.loadActiveItems(), [item])
         XCTAssertEqual(try repository!.loadDraft(), draft)
-        XCTAssertEqual(try repository!.archive().records.filter { $0.bucket == "event" }.count, 4)
+        XCTAssertEqual(try repository!.archive().records.filter { $0.bucket == "event" }.count, 0)
         repository = nil
     }
 
@@ -73,7 +73,7 @@ final class RepositoryTests: XCTestCase {
         let invalid = TodoEvent(itemID: original.id, kind: .edited, occurredAt: Date(timeIntervalSince1970: .nan))
         XCTAssertThrowsError(try repository.commit(modified, event: invalid, clearDraft: false))
         XCTAssertEqual(try repository.loadActiveItems(), [original])
-        XCTAssertEqual(try repository.archive().records.filter { $0.bucket == "event" }.count, 1)
+        XCTAssertEqual(try repository.archive().records.filter { $0.bucket == "event" }.count, 0)
     }
 
     @MainActor
@@ -88,19 +88,19 @@ final class RepositoryTests: XCTestCase {
         for version in ["0.1.1", "0.1.2", "0.1.3", "0.1.4"] {
             repository = try TodoRepository(paths: paths, appVersion: version)
             XCTAssertEqual(try repository!.loadActiveItems(), [item])
-            XCTAssertEqual(try repository!.archive().records.filter { $0.bucket == "event" }.count, 1)
+            XCTAssertEqual(try repository!.archive().records.filter { $0.bucket == "event" }.count, 0)
             repository = nil
         }
         let backups = try FileManager.default.contentsOfDirectory(at: paths.backups, includingPropertiesForKeys: nil)
             .filter { $0.lastPathComponent.hasPrefix("before-upgrade-") }
-        XCTAssertEqual(backups.count, 3)
+        XCTAssertEqual(backups.count, 1)
         for copy in backups {
             XCTAssertTrue(FileManager.default.fileExists(atPath: copy.appendingPathComponent("PinDo.store").path))
             XCTAssertTrue(FileManager.default.fileExists(atPath: copy.appendingPathComponent("StoreInfo.json").path))
             let manifest = try JSONDecoder().decode(StoreManifest.self, from: Data(contentsOf: copy.appendingPathComponent("StoreInfo.json")))
             let recovered = try TodoRepository(paths: AppPaths(root: copy), appVersion: manifest.lastAppVersion)
             XCTAssertEqual(try recovered.loadActiveItems(), [item])
-            XCTAssertEqual(try recovered.archive().records.filter { $0.bucket == "event" }.count, 1)
+            XCTAssertEqual(try recovered.archive().records.filter { $0.bucket == "event" }.count, 0)
         }
         XCTAssertThrowsError(try TodoRepository(paths: paths, appVersion: "0.1.0"))
     }
@@ -162,7 +162,7 @@ final class RepositoryTests: XCTestCase {
     }
 
     @MainActor
-    func testAutomaticBackupUsesLatestValuesAndRotatesSevenDays() async throws {
+    func testAutomaticBackupUsesOneVerifiedLatestRecoveryFile() async throws {
         let root = try directory()
         defer { try? FileManager.default.removeItem(at: root) }
         let repository = try TodoRepository(paths: AppPaths(root: root), appVersion: "0.1.0")
@@ -177,9 +177,10 @@ final class RepositoryTests: XCTestCase {
         }
         try await repository.createAutomaticBackupNow()
         let backups = try FileManager.default.contentsOfDirectory(at: repository.paths.backups, includingPropertiesForKeys: nil)
-            .filter { $0.lastPathComponent.hasPrefix("daily-") }.sorted { $0.lastPathComponent > $1.lastPathComponent }
-        XCTAssertEqual(backups.count, 7)
-        let latest = try BackupCodec.decode(Data(contentsOf: backups[0]))
+            .filter { $0.lastPathComponent == "recovery.latest.pindobackup" }
+        XCTAssertEqual(backups.count, 1)
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: repository.paths.backups.path).contains { $0.hasPrefix("daily-") })
+        let latest = try BackupCodec.decode(Data(contentsOf: XCTUnwrap(backups.first)))
         let stored = try JSONDecoder().decode(TodoItem.self, from: latest.records.first { $0.bucket == "todo-active" }!.payload)
         XCTAssertEqual(stored.title, "latest")
     }
